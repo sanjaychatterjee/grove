@@ -59,7 +59,7 @@ const (
 	// FinalizerComputeDomain is the finalizer added to ComputeDomains to prevent accidental
 	// deletion while workloads are using them. This finalizer is removed by the PCS controller
 	// during scale-in or PCS deletion.
-	FinalizerComputeDomain = "grove.io/" + ComputeDomainCRDName
+	FinalizerComputeDomain = "grove.io/computedomain-finalizer"
 
 	// MNNVLClaimName is the name used for the MNNVL resource claim in pod specs.
 	MNNVLClaimName = "mnnvl-claim"

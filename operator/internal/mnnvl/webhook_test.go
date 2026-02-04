@@ -86,12 +86,13 @@ func TestMutateAutoMNNVL(t *testing.T) {
 	}
 }
 
-func TestValidateAutoMNNVLOnCreate(t *testing.T) {
+func TestValidateMetadataOnCreate(t *testing.T) {
 	tests := []struct {
 		description      string
 		pcs              *grovecorev1alpha1.PodCliqueSet
 		autoMNNVLEnabled bool
 		expectError      bool
+		errorContains    string
 	}{
 		{
 			description:      "annotation enabled + feature enabled -> no error",
@@ -104,6 +105,7 @@ func TestValidateAutoMNNVLOnCreate(t *testing.T) {
 			pcs:              createPCSWithGPU(map[string]string{AnnotationAutoMNNVL: AnnotationAutoMNNVLEnabled}),
 			autoMNNVLEnabled: false,
 			expectError:      true,
+			errorContains:    "MNNVL is not enabled",
 		},
 		{
 			description:      "annotation disabled + feature disabled -> no error",
@@ -135,15 +137,58 @@ func TestValidateAutoMNNVLOnCreate(t *testing.T) {
 			autoMNNVLEnabled: false,
 			expectError:      false,
 		},
+		// Invalid annotation value tests
+		{
+			description:      "invalid annotation value 'true' -> error",
+			pcs:              createPCSWithGPU(map[string]string{AnnotationAutoMNNVL: "true"}),
+			autoMNNVLEnabled: true,
+			expectError:      true,
+			errorContains:    "must be",
+		},
+		{
+			description:      "invalid annotation value 'false' -> error",
+			pcs:              createPCSWithGPU(map[string]string{AnnotationAutoMNNVL: "false"}),
+			autoMNNVLEnabled: true,
+			expectError:      true,
+			errorContains:    "must be",
+		},
+		{
+			description:      "invalid annotation value empty string -> error",
+			pcs:              createPCSWithGPU(map[string]string{AnnotationAutoMNNVL: ""}),
+			autoMNNVLEnabled: true,
+			expectError:      true,
+			errorContains:    "must be",
+		},
+		{
+			description:      "invalid annotation value 'yes' -> error",
+			pcs:              createPCSWithGPU(map[string]string{AnnotationAutoMNNVL: "yes"}),
+			autoMNNVLEnabled: true,
+			expectError:      true,
+			errorContains:    "must be",
+		},
+		{
+			description:      "invalid annotation value 'ENABLED' (wrong case) -> error",
+			pcs:              createPCSWithGPU(map[string]string{AnnotationAutoMNNVL: "ENABLED"}),
+			autoMNNVLEnabled: true,
+			expectError:      true,
+			errorContains:    "must be",
+		},
+		{
+			description:      "invalid annotation value with feature disabled -> error (value validation first)",
+			pcs:              createPCSWithGPU(map[string]string{AnnotationAutoMNNVL: "invalid"}),
+			autoMNNVLEnabled: false,
+			expectError:      true,
+			errorContains:    "must be",
+		},
 	}
 
 	for _, test := range tests {
 		t.Run(test.description, func(t *testing.T) {
-			errs := ValidateAutoMNNVLOnCreate(test.pcs, test.autoMNNVLEnabled)
+			errs := ValidateMetadataOnCreate(test.pcs, test.autoMNNVLEnabled)
 
 			if test.expectError {
 				assert.NotEmpty(t, errs, "expected validation errors")
-				assert.Contains(t, errs.ToAggregate().Error(), "MNNVL is not enabled")
+				assert.Contains(t, errs.ToAggregate().Error(), test.errorContains)
 			} else {
 				assert.Empty(t, errs, "expected no validation errors")
 			}
@@ -151,7 +196,7 @@ func TestValidateAutoMNNVLOnCreate(t *testing.T) {
 	}
 }
 
-func TestValidateAutoMNNVLOnUpdate(t *testing.T) {
+func TestValidateMetadataOnUpdate(t *testing.T) {
 	tests := []struct {
 		description string
 		oldPCS      *grovecorev1alpha1.PodCliqueSet
@@ -215,7 +260,7 @@ func TestValidateAutoMNNVLOnUpdate(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.description, func(t *testing.T) {
-			errs := ValidateAutoMNNVLOnUpdate(test.oldPCS, test.newPCS)
+			errs := ValidateMetadataOnUpdate(test.oldPCS, test.newPCS)
 
 			if test.expectError {
 				assert.NotEmpty(t, errs, "expected validation errors")
