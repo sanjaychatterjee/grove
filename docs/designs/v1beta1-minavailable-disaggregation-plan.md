@@ -1,6 +1,6 @@
 # Implementation Plan: MinAvailable Disaggregation and Promotion to `grove.io/v1beta1`
 
-Source design: GREP-0877: Terminal States, Termination and Restart Policies ([PR #878](https://github.com/ai-dynamo/grove/pull/878), revision `eda4763`, at `docs/proposals/0877-termination-and-restart-policies/README.md` on the `terminal-states` branch). This plan details **Phase 1** of the GREP's Implementation Plan. The code references below were checked against upstream `main` at `a5be55f`. It covers the sections "Disaggregating MinAvailable", "API changes", "Defaults", "Validation" and "Migration from legacy fields", and clarification 15 (when breach evaluation starts). Tracking issue: [#877](https://github.com/ai-dynamo/grove/issues/877).
+Source design: GREP-0877: Terminal States, Termination and Restart Policies ([PR #878](https://github.com/ai-dynamo/grove/pull/878), revision `1560cbc`, at `docs/proposals/0877-termination-and-restart-policies/README.md` on the `terminal-states` branch). This plan details **Phase 1** of the GREP's Implementation Plan. The code references below were checked against upstream `main` at `a5be55f`. It covers the sections "Disaggregating MinAvailable", "API changes", "Defaults", "Validation" and "Migration from legacy fields", and clarification 15 (when breach evaluation starts). Tracking issue: [#877](https://github.com/ai-dynamo/grove/issues/877).
 
 ## 1. Scope
 
@@ -43,7 +43,7 @@ Behavioural contract, the GREP's Phase 1 exit criteria: **every existing `v1alph
 1. **The legacy default is `1`.** `PodCliqueSpec.MinAvailable` and `PodCliqueScalingGroupConfig.MinAvailable` carry `+kubebuilder:default=1`, and the API server applies schema defaults before the defaulting webhook runs. The GREP's migration table now matches this.
 2. **The generation hashes are safe.** `computeGenerationHash` (`podcliqueset/reconcilespec.go`) and `ComputePCLQPodTemplateHash` (`utils/component/podclique.go`) hash only labels, annotations, pod spec and priority class. Moving the min-replica, update and termination fields therefore cannot trigger a rolling update. The upgrade test asserts this.
 3. **All admission webhooks use `matchPolicy: Exact` on `v1alpha1`.** That covers PCS defaulting and validation, PCLQ and PCSG validation (including `/scale`), ClusterTopologyBinding validation, and the authorizer rule for `podcliques`, `podcliquescalinggroups` and `podgangmaps`. If v1beta1 is served without changing them, v1beta1 writes bypass validation and the authorizer. GREP Phase 1 step 2 requires the switch to land in the same change; §6.3 implements it.
-4. **CRDs ship through Helm's `crds/` directory** (`operator/hack/prepare-charts.sh`), plus the opt-in `crdInstaller` (GREP-436). Files in `crds/` cannot be templated, but `spec.conversion.webhook.clientConfig.service.namespace` depends on the release namespace. A multi-version CRD without `spec.conversion` falls back to `strategy: None`, under which a v1alpha1 request's `minAvailable` is silently pruned. The GREP says "`spec.conversion` on the CRDs" but not how it is delivered; §6.1 covers that.
+4. **CRDs ship through Helm's `crds/` directory** (`operator/hack/prepare-charts.sh`), plus the opt-in `crdInstaller` (GREP-436). Files in `crds/` cannot be templated, but `spec.conversion.webhook.clientConfig.service.namespace` depends on the release namespace. A multi-version CRD without `spec.conversion` falls back to `strategy: None`, under which a v1alpha1 request's `minAvailable` is silently pruned. GREP step 2 now delivers it by moving the three converted CRDs to chart templates (option A, §6.1).
 5. **Webhook certificates are managed by OPA cert-controller** (`internal/controller/cert/cert.go`) in `auto` mode, and by cert-manager in `manual` mode. cert-controller supports a `CRDConversion` webhook type for `caBundle` injection.
 6. **About 267 Go files import `operator/api/core/v1alpha1`**, which is why the import switch is its own mechanical commit (GREP step 3, §8 commit 3).
 7. **About 30 non-test call sites read `MinAvailable`, `TerminationDelay` or the int32 `MaxUnavailable`.** These include the Kueue scheduler backend ([#707](https://github.com/ai-dynamo/grove/pull/707)) and the Coherent sub-step planner. §7.3 maps each one to a purpose.
@@ -57,7 +57,7 @@ Behavioural contract, the GREP's Phase 1 exit criteria: **every existing `v1alph
 
 ## 3. Release strategy (GREP Phase 1, steps 7–9)
 
-The GREP introduces v1beta1 (steps 7–8) and switches storage one release later. This plan does both in **one release, N**: v1beta1 is served, becomes the storage version, and all objects are migrated to it.
+As in GREP steps 8 and 9, Phase 1 ships in **one release, N**: v1beta1 is served, becomes the storage version, and all objects are migrated to it.
 
 | Release | v1alpha1 | v1beta1 | Storage | Operator internals | Rollback to previous release |
 |---|---|---|---|---|---|
@@ -230,7 +230,7 @@ The CA (completion-aware) column of the GREP table (`init.minReplicas: spec.repl
 - **Autoscaling:** `scaleConfig.minReplicas ≥ availability.minReplicas`. This replaces the current `≥ minAvailable`.
 - **`rollingUpdate` rules:** today's rules stay, with `minReplicas` in place of `minAvailable` (`validateRollingUpdateConfiguration` in `pcs/validation/podcliqueset.go`):
   - `rollingUpdate` is rejected on a PCSG-member clique template;
-  - `maxUnavailable` must be an integer `≥ 1` or a percentage in `[1%, 100%]`. There is no upper bound against `replicas`. [#884](https://github.com/ai-dynamo/grove/pull/884) removed it because the live PCLQ or PCSG is scaled independently of the template through `/scale`, and runtime planning already caps disruption at the replicas that remain. The GREP's validation section still says `[1, replicas]` and should be aligned (§11.1);
+  - `maxUnavailable` must be an integer `≥ 1` or a percentage in `[1%, 100%]`. There is no upper bound against `replicas`. [#884](https://github.com/ai-dynamo/grove/pull/884) removed it because the live PCLQ or PCSG is scaled independently of the template through `/scale`, and runtime planning already caps disruption at the replicas that remain;
   - under `Coherent`, the resolved `maxUnavailable` must be `≥ rollingUpdate.minReplicas`, and the controllers also use `max(resolved, minReplicas)` at run time;
   - `rollingUpdate.minReplicas` is rejected under `RollingRecreate`, and all of `rollingUpdate` is rejected under `OnDelete`, as today.
 - **Immutable:** `init.minReplicas`, `rollingUpdate.minReplicas` and `availability.minReplicas`. Adding or removing `availability` is also rejected, because it switches gang termination on or off (§11 item 2).
@@ -347,7 +347,7 @@ With option A:
 - `operator/hack/prepare-charts.sh` writes the three generated CRDs into templates. It adds the templated `spec.conversion`, the `cert-manager.io/inject-ca-from` annotation in `manual` mode (§6.2), and the `lookup`-based storage version (§3).
 - **Adoption of existing CRDs.** Helm refuses to take over a CRD that it did not create. Before the upgrade, a pre-upgrade hook adds `app.kubernetes.io/managed-by: Helm` and the `meta.helm.sh/release-name` and `meta.helm.sh/release-namespace` annotations to the three live CRDs. When the `crdInstaller` is enabled, it does the same. The hook needs `get` and `patch` on those CRDs, limited by `resourceNames`. A chart test and the upgrade e2e test cover the adoption (§9).
 - The `crdInstaller` still renders `spec.conversion` itself when enabled, so `install-crds` and Helm stay consistent.
-- The GREP-436 owners must agree to the three CRDs moving out of `crds/`, and GREP step 2 should name option A (§11.1).
+- GREP step 2 names option A. The GREP-436 owners must still agree to the three CRDs moving out of `crds/`.
 
 ### 6.2 Certificates
 
@@ -525,7 +525,7 @@ All Phase 1 work for release N lands as **one PR**. Release N is cut right after
 
 | PR | Content | Behaviour change |
 |---|---|---|
-| **0** | Merge GREP-0877 ([#878](https://github.com/ai-dynamo/grove/pull/878)). Revision `eda4763` already includes the §11.1 feedback. | None |
+| **0** | Merge GREP-0877 ([#878](https://github.com/ai-dynamo/grove/pull/878)). Revision `1560cbc` already includes all the §11.1 feedback. | None |
 | **1** [1–8, 10] | The complete v1beta1 promotion, Phase 1 field split, `startsAfter` change, storage switch, tests and docs, as the ordered commits below. **Cut release N** after it merges. | v1alpha1: none. v1beta1-native: new semantics. Storage moves to v1beta1. |
 | **2** | Release N+1: move `+kubebuilder:storageversion` to v1beta1 in the source, which makes the switch runnable a no-op. Delete `WasPCSGEverHealthy` and `InitialScheduleGrace`, the PCSG upgrade carry-over (§7.6). | None |
 | **3** [9] | Release N+3, after the two-release window (N+1, N+2): stop serving v1alpha1 and remove it from the CRDs through the GREP-436 upgrader. Delete the v1alpha1 package, the conversion code, the v1alpha1 CEL rules, the storage switch and `downgrade-storage`. | Breaking for v1alpha1 clients |
@@ -677,33 +677,32 @@ Resolved by GREP revision `37c2bb8`, versus the first draft of this plan:
 
 ### 11.1 Decided for this plan, and folded into the GREP
 
-This feedback for [#878](https://github.com/ai-dynamo/grove/pull/878) is in GREP revision `eda4763`, together with clarification 15, the awaiting states (§7.6). The items are kept here for reference:
+All of this plan's feedback for [#878](https://github.com/ai-dynamo/grove/pull/878) is now in the GREP. Revision `eda4763` added items 1–7, the two fixes against `main` and clarification 15 (the awaiting states, §7.6). Revision `1560cbc` added the rest. Nothing is outstanding. The items are kept here for reference:
 
-1. **Ready threshold when `availability` is nil is `init.minReplicas`.** The resource counts as available once its gang-scheduled minimum is ready (§7.1). The GREP should define `ReadyThreshold` alongside clarification 12.
-2. **Adding or removing `availability` is rejected** (§4.5). The GREP's immutable-fields list should say so.
-3. **`breachTolerance` on converted PCLQ and PCSG objects comes from the PCS-level v1alpha1 `template.terminationDelay`** (§5.2). The value is resolved through the owning PCS, because conversion is pure. The GREP's migration table should add this to its `terminationDelay` row.
-4. **`packDomain` is dropped from v1beta1** and converted to `pack.required` (§4.3, §5.2, §5.3). The GREP's API changes and migration table should list it.
-5. **v1alpha1 is served for two releases after the storage migration**: N+1 and N+2, with removal in N+3 (§3). This fills in GREP step 9.
-6. **Introduction and storage switch are combined into one release, N** (§3). The GREP's steps 7 and 8 put the storage switch one release after v1beta1 is introduced, so the GREP should be updated. Three mechanisms replace the free rollback that the extra release gave: a staged switch performed by the operator once `/convert` is serving, sticky storage (§3), and the downgrade procedure (§7.5).
-7. **All release-N work lands as one PR** of eight ordered commits, after which N is cut (§8). The commits keep the GREP's Phase 1 step order. The GREP's implementation plan should say that steps 1–8 and 10 may land together, as long as each step remains a separately buildable commit.
+1. **Ready threshold when `availability` is nil is `init.minReplicas`.** The resource counts as available once its gang-scheduled minimum is ready (§7.1; GREP clarification 14).
+2. **Adding or removing `availability` is rejected** (§4.5; GREP immutable-fields list).
+3. **`breachTolerance` on converted PCLQ and PCSG objects comes from the PCS-level v1alpha1 `template.terminationDelay`**, resolved through the owning PCS because conversion is pure (§5.2; GREP migration table).
+4. **`packDomain` is dropped from v1beta1** and converted to `pack.required` (§4.3, §5.2, §5.3; GREP API changes and migration table).
+5. **v1alpha1 is served for two releases after the storage migration**: N+1 and N+2, with removal in N+3 (§3; GREP step 9).
+6. **Introduction and storage switch are combined into one release, N**, with a staged switch, sticky storage and a downgrade procedure (§3, §7.5; GREP step 8).
+7. **All release-N work lands as one PR** of ordered, separately buildable commits (§8; GREP Phase 1 introduction).
+Added in `1560cbc`:
 
-The GREP text was also out of date with `main` on two points, and `eda4763` fixes both:
+- **Upgrades into N+1 and later must pass through N** (§3; GREP step 9).
+- **`maxUnavailable` is resolved on every reconcile, not frozen** (item 8; GREP "Interaction with existing features" and Test Plan).
+- **CRD delivery is option A, and PodGangMap and ClusterTopologyBinding use `conversion.strategy: None`** (items 9 and 10, §6.1, §5.1; GREP step 2).
+- **`rollingUpdate.maxUnavailable` and `rollingUpdate.progressDeadline` stay mutable** (§4.5; GREP mutable-fields list).
 
-- **`maxUnavailable` upper bound.** The GREP's validation section requires `[1, replicas]`. [#884](https://github.com/ai-dynamo/grove/pull/884) removed that bound, so the rule should read "integer `≥ 1` or percentage in `[1%, 100%]`" (§4.5). The GREP's "percentage of the component's `spec.replicas`" should say the *live* component's `spec.replicas`.
-- **Kueue backend.** The GREP's "Interaction with existing features" lists gang-scheduling call sites but not the Kueue backend ([#707](https://github.com/ai-dynamo/grove/pull/707)). The backend's partial-gang rule and base PodGroup count become `init.minReplicas` (§7.3).
+Two fixes against `main`, both added in `eda4763`:
 
-Not yet in the GREP. These go into the next update of #878:
-
-- **Upgrades into N+1 and later must pass through N** (§3). GREP step 9 should say so.
-- **`maxUnavailable` is not frozen** (item 8). "Interaction with existing features" says that "a Coherent update freezes the resolved value in its plan when it starts". That is wrong. Every reconcile resolves the value again against the live component's `spec.replicas`, as Deployments do.
-- **CRD delivery is option A** (item 9). GREP step 2 should say that the PodCliqueSet, PodClique and PodCliqueScalingGroup CRDs move to chart templates, which diverges from GREP-436's `crds/` layout for those three kinds.
-- **PodGangMap and ClusterTopologyBinding use `conversion.strategy: None`** (item 10). GREP step 2 lists every kind as converted, without saying how.
+- **`maxUnavailable` upper bound.** [#884](https://github.com/ai-dynamo/grove/pull/884) removed it. The rule is "integer `≥ 1` or percentage in `[1%, 100%]`", resolved against the live component's `spec.replicas` (§4.5).
+- **Kueue backend** ([#707](https://github.com/ai-dynamo/grove/pull/707)). Its partial-gang rule and base PodGroup count become `init.minReplicas` (§7.3).
 
 ### 11.2 Resolved before PR 1
 
 These were deferred. Release N is cut right after PR 1 (§8), so each needed a decision before the commit that uses it.
 
-8. **`maxUnavailable` is not frozen.** Every reconcile resolves it again against the live component's `spec.replicas`, under `Coherent` as `max(resolved, minReplicas)`. So no new status field is needed, and the v1beta1 schema gains nothing for it. The GREP's "freezes the resolved value in its plan" is wrong and will be fixed (§11.1). §7.3 and §10 follow this. (Commit 4.)
+8. **`maxUnavailable` is not frozen.** Every reconcile resolves it again against the live component's `spec.replicas`, under `Coherent` as `max(resolved, minReplicas)`. So no new status field is needed, and the v1beta1 schema gains nothing for it. GREP revision `1560cbc` removed its "freezes the resolved value in its plan" wording (§11.1). §7.3 and §10 follow this. (Commit 4.)
 9. **CRD delivery uses option A** (§6.1). The PodCliqueSet, PodClique and PodCliqueScalingGroup CRDs move to chart templates, with `helm.sh/resource-policy: keep`, a templated `spec.conversion`, a pre-upgrade adoption hook, and a `lookup` that keeps storage sticky (§3). The GREP-436 owners still need to agree to the layout change. (Commit 2; the sticky-storage part in commit 5.)
 10. **PodGangMap and ClusterTopologyBinding use `conversion.strategy: None`** (§5.1). Their schemas are identical, so they never call the webhook, and their storage switches in N without it (§7.4). (Commit 2.)
 
