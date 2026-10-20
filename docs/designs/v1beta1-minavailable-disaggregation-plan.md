@@ -74,7 +74,7 @@ The deprecation window is the two releases that follow the storage migration in 
 
 The storage flag is **sticky**: nothing may move it back to v1alpha1 within N.
 - The `crdInstaller` keeps the live storage version when the live CRD already stores v1beta1.
-- With §6.1 option A, the Helm templates render the live storage version via `lookup`.
+- The Helm templates for the three converted CRDs (§6.1, option A) render the live storage version via `lookup`.
 - A manual `kubectl apply` of N's manifests would revert it. The runnable watches the CRDs and switches again, and the migrator re-runs; this is self-healing. The upgrade guide says to use the chart or `install-crds`.
 
 From N+1 the marker is on v1beta1 in the source, and the switch runnable is a no-op. It is deleted in N+3.
@@ -260,7 +260,7 @@ Validation runs once, on the v1beta1 form (§6.3), so a v1alpha1 user's error me
 - Hub: v1beta1. Spoke: v1alpha1, implementing `conversion.Convertible`.
 - Generate the field copying with **conversion-gen**: add `+k8s:conversion-gen=github.com/ai-dynamo/grove/operator/api/core/v1beta1` to `v1alpha1/doc.go`. conversion-gen refuses to compile until every non-trivial field has a hand-written `Convert_*` function, so a field added in Phase 2 cannot be dropped silently.
 - Hand-written functions live in `operator/api/core/v1alpha1/conversion.go`. They must be pure: no API calls, no defaulting, deterministic.
-- **PodGangMap and ClusterTopologyBinding** have identical schemas in both versions and use `conversion.strategy: None`, so they do not depend on the webhook. A unit test asserts that the schemas are structurally identical.
+- **PodGangMap and ClusterTopologyBinding** have identical schemas in both versions and use `conversion.strategy: None` (decided, §11 item 10), so they do not depend on the webhook. A unit test asserts that the schemas are structurally identical.
 
 ### 5.2 Translation from v1alpha1 to v1beta1 (`ConvertTo`), as in the GREP's migration table
 
@@ -334,21 +334,27 @@ The GREP's Phase 2 migration treats **an unset `resource.restart` on a long-runn
 
 ### 6.1 CRD `spec.conversion`
 
-The PodCliqueSet, PodClique and PodCliqueScalingGroup CRDs need `spec.conversion.webhook.clientConfig.service.{name, namespace, path}`.
+The PodCliqueSet, PodClique and PodCliqueScalingGroup CRDs need `spec.conversion.webhook.clientConfig.service.{name, namespace, path}`. **Option A is chosen** (§11 item 9).
 
 | Option | Pros | Cons |
 |---|---|---|
-| **A (recommended).** Move these three CRDs from `crds/` to `templates/` with `helm.sh/resource-policy: keep`. Template `spec.conversion` from `Release.Namespace` and `service.name`. | Conversion config is always correct and applied atomically with the operator upgrade. Helm also upgrades these CRDs. | Diverges from GREP-436's `crds/` choice for three kinds. Existing installs need an adoption step: Helm ownership labels and annotations on the CRDs, set by the `crdInstaller` or a pre-upgrade hook. |
+| **A (chosen).** Move these three CRDs from `crds/` to `templates/` with `helm.sh/resource-policy: keep`. Template `spec.conversion` from `Release.Namespace` and `service.name`. | Conversion config is always correct and applied atomically with the operator upgrade. Helm also upgrades these CRDs. | Diverges from GREP-436's `crds/` choice for three kinds. Existing installs need an adoption step: Helm ownership labels and annotations on the CRDs, set by the `crdInstaller` or a pre-upgrade hook. |
 | B. Keep `crds/`. The `crdInstaller` (namespace from the downward API) or the operator at startup patches `spec.conversion`. | Keeps the GREP-436 layout. | Until the patch lands, the CRD has two versions and `strategy: None`, so fields are silently pruned (finding 4). It also makes `crdInstaller` mandatory. |
 
-In either option, the `crdInstaller` renders `spec.conversion` itself when enabled, so `install-crds` and Helm stay consistent.
+With option A:
+
+- The three CRDs live in `charts/templates/` with `helm.sh/resource-policy: keep`, so `helm uninstall` never deletes them or the workloads. PodGangMap, ClusterTopologyBinding and the `scheduler.grove.io` CRDs stay in `crds/`.
+- `operator/hack/prepare-charts.sh` writes the three generated CRDs into templates. It adds the templated `spec.conversion`, the `cert-manager.io/inject-ca-from` annotation in `manual` mode (§6.2), and the `lookup`-based storage version (§3).
+- **Adoption of existing CRDs.** Helm refuses to take over a CRD that it did not create. Before the upgrade, a pre-upgrade hook adds `app.kubernetes.io/managed-by: Helm` and the `meta.helm.sh/release-name` and `meta.helm.sh/release-namespace` annotations to the three live CRDs. When the `crdInstaller` is enabled, it does the same. The hook needs `get` and `patch` on those CRDs, limited by `resourceNames`. A chart test and the upgrade e2e test cover the adoption (§9).
+- The `crdInstaller` still renders `spec.conversion` itself when enabled, so `install-crds` and Helm stay consistent.
+- The GREP-436 owners must agree to the three CRDs moving out of `crds/`, and GREP step 2 should name option A (§11.1).
 
 ### 6.2 Certificates
 
 - **`auto` mode:** add `cert.WebhookInfo{Type: cert.CRDConversion, Name: "<plural>.grove.io"}` for the three CRDs in `getWebhooks`. Grant `get`, `list`, `watch`, `update` and `patch` on `customresourcedefinitions` in `clusterrole.yaml`, restricted by `resourceNames`.
   - The existing CRD rule in `clusterrole.yaml` is inside `{{- if .Values.crdInstaller.enabled }}` and has no `list` or `watch`. The conversion rule must be a separate, **unconditional** rule, because `caBundle` injection is needed whether or not the installer is enabled.
   - Leave the legacy `clustertopologies.grove.io` name out of it; that CRD is never converted.
-- **`manual` mode:** add `cert-manager.io/inject-ca-from: <ns>/<cert>` to the templated CRDs. Option A makes this possible.
+- **`manual` mode:** add `cert-manager.io/inject-ca-from: <ns>/<cert>` to the templated CRDs, which option A makes possible.
 - Extend `e2e/tests/cert_management_test.go` to cover CRD `caBundle` injection and rotation in both modes.
 
 ### 6.3 Admission webhook configurations
@@ -432,7 +438,7 @@ Switch the alias `grovecorev1alpha1` to `grovecorev1beta1` across `operator/inte
 | `podclique/reconciler.go` resync interval | PCS `TerminationDelay` | the PCLQ's `BreachTolerance` |
 | `podcliqueset/components/podcliquesetreplica/rollingupdate.go` scheduled-pod count | member `MinAvailable` | `InitMinReplicas` |
 | `utils/component/rollingupdate.go` `EffectiveMaxUnavailable`, `CoherentMinAvailableByComponent`, `CoherentMaxUnavailableByComponent` | `MinAvailable`, int32 `MaxUnavailable` | `UpdateMinReplicas`, `ResolvedMaxUnavailable` |
-| `podgangmap/syncflow.go` `computeMVUTemplate` | `MinAvailable` (via `CoherentMinAvailableByComponent`) | `UpdateMinReplicas`; the resolved `maxUnavailable` is frozen in the plan when the update starts (deferred, §11 item 8) |
+| `podgangmap/syncflow.go` `computeMVUTemplate` | `MinAvailable` (via `CoherentMinAvailableByComponent`) | `UpdateMinReplicas`. The `maxUnavailable` that it consumes is resolved again on every reconcile, and is not frozen (§11 item 8). |
 | `podgangmap/substepplanner.go` (anchor-bearing step targets and the per-sub-step budget) | `CoherentMinAvailableByComponent`, `CoherentMaxUnavailableByComponent` | no direct change; it consumes the two helpers above |
 | `scheduler/kueue/backend.go` `basePodGangPodGroupCount` | PCSG `MinAvailable` | `InitMinReplicas` (PCSG) |
 | `scheduler/kueue/backend.go` partial-gang rejection (`0 < minAvailable < replicas`) | clique `MinAvailable` | `InitMinReplicas`. Its comment "a nil minAvailable defaults to replicas" is wrong today (the schema default is `1`) and becomes moot, because `init.minReplicas` is always set after defaulting. |
@@ -529,10 +535,10 @@ PR 1 is organized as eight commits, in this order. **Each commit builds and pass
 | Commit | Content | Behaviour change at that commit |
 |---|---|---|
 | **1** [1] | Accessor layer (§7.1) on v1alpha1, with unit tests that pin today's values. It includes `StartupDependencies`, plus `initc` support for the optional `:<conditionType>` argument (it parses but never emits it yet). | None |
-| **2** [2] | v1beta1 package as an identical copy of v1alpha1, plus `Hub()`. Trivial generated conversion. Multi-version CRDs (storage v1alpha1). `/convert`. CRD `spec.conversion` (§6.1). `caBundle` injection and RBAC (§6.2). **Webhook rules switched to v1beta1 with `Equivalent`**, and `internal/webhook/...` handlers moved to v1beta1 types (§6.3). | None. The schemas are identical. |
+| **2** [2] | v1beta1 package as an identical copy of v1alpha1, plus `Hub()`. Trivial generated conversion. Multi-version CRDs (storage v1alpha1). `/convert`. The three converted CRDs move to chart templates with the templated `spec.conversion` and the Helm adoption hook (§6.1, option A). `caBundle` injection and RBAC (§6.2). **Webhook rules switched to v1beta1 with `Equivalent`**, and `internal/webhook/...` handlers moved to v1beta1 types (§6.3). | None. The schemas are identical. |
 | **3** [3] | Mechanical import switch (§7.2) and regenerated clients. | None |
-| **4** [4, 5, 6] | v1beta1 schema (§4.2–4.3), including dropping `packDomain` and the `[]StartupDependency` form of `startsAfter`. Hand-written conversion with the stash (§5.2–5.3), plus fuzz and table tests. v1alpha1 CEL rules. Deprecation markers. Accessors on v1beta1 fields. Defaulting and validation, including the immutability exception (§4.4–4.5). Scale guard. Per-component `breachTolerance`. Percentage `maxUnavailable` in update orchestration. `startsAfter` validation, and the per-dependency condition type passed to and enforced by `initc`. `MinAvailableBreached` awaiting states, with the PCSG upgrade carry-over (§7.6). Printer columns. | v1alpha1: none, except that `MinAvailableBreached` is `Unknown` during startup and a PCLQ's breach tolerance runs from its first schedule (§7.6). v1beta1-native: new semantics. |
-| **5** [8] | Storage switch and migrator (§7.4), the sticky-storage handling in the `crdInstaller` and the chart (§3), and the downgrade procedure (§7.5). | Storage only |
+| **4** [4, 5, 6] | v1beta1 schema (§4.2–4.3), including dropping `packDomain` and the `[]StartupDependency` form of `startsAfter`. Hand-written conversion with the stash (§5.2–5.3), plus fuzz and table tests. v1alpha1 CEL rules. Deprecation markers. Accessors on v1beta1 fields. Defaulting and validation, including the immutability exception (§4.4–4.5). Scale guard. Per-component `breachTolerance`. Percentage `maxUnavailable` in update orchestration. `startsAfter` validation, and the per-dependency condition type passed to and enforced by `initc`. `MinAvailableBreached` awaiting states, with the PCSG upgrade carry-over (§7.6). Printer columns. v1beta1 status doc fixes (§11 item 17). | v1alpha1: none, except that `MinAvailableBreached` is `Unknown` during startup and a PCLQ's breach tolerance runs from its first schedule (§7.6). v1beta1-native: new semantics. |
+| **5** [8] | Storage switch and migrator (§7.4), the sticky-storage handling in the `crdInstaller` and the chart's `lookup` (§3), and the downgrade procedure (§7.5). | Storage only |
 | **6** [10] | Envtest and e2e from §9: upgrade from N-1 under live traffic, downgrade to N-1, operator restarts, the equivalence suites with v1alpha1 and v1beta1 manifests, Story 1 and the #859 scenario. | — |
 | **7** [7] | Docs and samples:<br>- `docs/api-reference` (add v1beta1 to `hack/generate-api-docs.sh`);<br>- user guide and samples on v1beta1, keeping one v1alpha1 sample. This includes the startup-ordering samples (`simple2`/`simple3-explicit-startup-order.yaml`) and the e2e workloads that use `startsAfter`;<br>- a migration guide with the §5.2 table. | — |
 | **8** | Release notes covering the downgrade procedure (§7.5), the v1alpha1 removal in N+3, upgrades into N+1 and later only from N (§3), `MinAvailableBreached=Unknown` during startup and the breach-timing change (§7.6), and Go consumers such as Dynamo. | — |
@@ -585,7 +591,11 @@ What one PR changes compared with a PR series:
   - With `availability` nil, the condition is `False` in all of these cases.
 - **Accessor parity:** at commit 1, the accessors return today's values; at commit 4, they return the same values for converted objects.
 - **Phase 2 safety:** neither conversion nor the stash ever produces a `restart` field (§5.4).
-- **Chart:** no `grove.io` webhook rule uses `Exact`, and every rule includes v1beta1.
+- **Chart:**
+  - no `grove.io` webhook rule uses `Exact`, and every rule includes v1beta1;
+  - the PodCliqueSet, PodClique and PodCliqueScalingGroup CRDs render from templates. Each has `helm.sh/resource-policy: keep`, a `spec.conversion` that points at the release namespace, and the `inject-ca-from` annotation in `manual` mode;
+  - with a stubbed `lookup` that returns a live CRD stored at v1beta1, the rendered storage version is v1beta1;
+  - PodGangMap and ClusterTopologyBinding stay in `crds/` with `strategy: None`.
 - **PodGangs:** PodGang annotations never contain `grove.io/v1beta1-conversion-data`.
 
 **Envtest**, with CRD conversion patched to the local webhook server via `WebhookInstallOptions`:
@@ -604,7 +614,8 @@ What one PR changes compared with a PR series:
     - objects read correctly at both versions;
     - a PCLQ breach still gang-terminates after the original delay;
     - a PCSG that was never healthy at the upgrade is not gang-terminated, and a PCSG that was healthy and then breached is gang-terminated after the delay (§7.6);
-    - the storage switch happens only after `/convert` is ready, the migrator completes, and `storedVersions == ["v1beta1"]`.
+    - the storage switch happens only after `/convert` is ready, the migrator completes, and `storedVersions == ["v1beta1"]`;
+    - Helm adopts the three CRDs that N-1 installed from `crds/`, and later `helm upgrade` runs keep managing them (§6.1).
 - **Upgrade under load:** during the N-1 → N upgrade, a client keeps writing v1alpha1 PodCliqueSets while the N-1 operator keeps reconciling. No write fails apart from ordinary conflicts. That holds because storage stays v1alpha1 until N serves `/convert` (§3).
 - **Sticky storage:** re-running the `crdInstaller` init container and running `helm upgrade` with changed values both leave storage on v1beta1. A manual `kubectl apply` of N's CRDs is switched back by the runnable, and the migrator re-runs.
 - **Downgrade:** `install-crds downgrade-storage` then N → N-1 keeps workloads running and readable at v1alpha1. Upgrading back to N restores v1beta1-only values from the annotation.
@@ -615,7 +626,7 @@ What one PR changes compared with a PR series:
   - A PodCliqueSet that cannot be scheduled shows `MinBreached` `Unknown` on its PCLQs and PCSGs and is never gang-terminated. A clique that is scheduled but never becomes ready is gang-terminated `breachTolerance` after its first schedule (§7.6).
   - A PCSG whose members have no `availability` counts a replica as available only once each member has `init.minReplicas` ready pods.
   - A Coherent update with `rollingUpdate.minReplicas` larger than `availability.minReplicas` rolls in the larger unit.
-  - A percentage `maxUnavailable` is resolved correctly before and after scaling.
+  - A percentage `maxUnavailable` is resolved correctly before and after scaling, and also after a scale-out or scale-in in the middle of an update, where the next reconcile uses the new budget (§11 item 8).
   - `rollingUpdate.minReplicas` is rejected under `RollingRecreate` and `OnDelete`, filled in when switching to `Coherent`, and must be removed when switching away.
   - The #859 pre-Ready scenario: the leader clique declares a readiness gate `example.com/placeholder-available` and cannot become `Ready` until the dependent clique runs. The dependent clique has `startsAfter: [{name: leader, conditionType: example.com/placeholder-available}]`. Once the test sets the condition on the required leader pods, the dependent leaves `Init` while the leaders are still not `Ready`, so there is no deadlock. Deleting a leader pod before the condition is set keeps the dependent blocked. This extends `startup_ordering_test.go`.
   - The existing `startup_ordering_test.go` passes unchanged with v1alpha1 manifests, as part of the equivalence runs.
@@ -631,11 +642,12 @@ What one PR changes compared with a PR series:
 | Risk | Mitigation |
 |---|---|
 | **The operator is down, so conversion is down.** v1alpha1 reads and writes fail. In N, between the storage switch and the end of migration, reads of unmigrated objects also fail at v1beta1. | Run 2 or more operator replicas with a PodDisruptionBudget; webhooks run on all replicas. Add `/convert` readiness. The migrator shortens the window. |
-| **Silent field pruning under `strategy: None`** (finding 4) | §6.1 option A. The `crdInstaller` always writes `spec.conversion`. A test fails if a multi-version CRD lacks it. |
+| **Silent field pruning under `strategy: None`** (finding 4) | Option A (§6.1) templates `spec.conversion`, and the `crdInstaller` always writes it. A test fails if a multi-version CRD lacks it. |
 | **Validation and authorizer bypass at v1beta1** (finding 3) | Commit 2 switches every rule to v1beta1 with `Equivalent`, backed by the chart test. |
 | **Lossy v1beta1 → v1alpha1 for older clients** such as Dynamo | Round-trip annotation (§5.3), fuzz tests, and release notes asking consumers to move to v1beta1. |
 | **A v1alpha1 client switches `updateStrategy` while a stash holds `rollingUpdate.minReplicas`** | The strategy-aware overlay rule (§5.3) and a fuzz case for it. |
-| **Percentage `maxUnavailable` drifts with scaling mid-update** | Freeze the resolved value in the Coherent plan; use `max(resolved, minReplicas)` at run time (GREP, Interaction with existing features). |
+| **Percentage `maxUnavailable` changes with scaling mid-update** | This is intended, and matches Deployments. Every reconcile resolves the value again against the live component's `spec.replicas`, so a scale-out raises the budget and a scale-in lowers it. Under `Coherent`, `max(resolved, minReplicas)` keeps the budget at least the minimum update unit, and runtime planning caps disruption at the replicas that remain (#884). A unit test and the e2e scaling case in §9 cover it. |
+| **Helm cannot adopt the three CRDs on upgrade** (option A, §6.1) | The pre-upgrade hook and the `crdInstaller` add Helm ownership metadata first. The upgrade e2e starts from an N-1 install whose CRDs came from `crds/`. |
 | **A plain rollback from N to N-1 fails after the storage switch** | The downgrade procedure (§7.5), tested in e2e and documented in the release notes. N+1 → N and later rollbacks are plain. |
 | **Writes fail during the N-1 → N upgrade** because storage moved before anything served `/convert` | Staged switch (§3). N's CRDs keep v1alpha1 storage, and the N operator switches only once `/convert` and `caBundle` are ready. An e2e test runs the upgrade under write load. |
 | **Something reverts the storage flag within N** (manual `kubectl apply`, Helm re-render) | The flag is sticky in the `crdInstaller` and the chart (`lookup`). The runnable re-applies the switch, and the migrator re-runs. |
@@ -680,15 +692,20 @@ The GREP text was also out of date with `main` on two points, and `eda4763` fixe
 - **`maxUnavailable` upper bound.** The GREP's validation section requires `[1, replicas]`. [#884](https://github.com/ai-dynamo/grove/pull/884) removed that bound, so the rule should read "integer `≥ 1` or percentage in `[1%, 100%]`" (§4.5). The GREP's "percentage of the component's `spec.replicas`" should say the *live* component's `spec.replicas`.
 - **Kueue backend.** The GREP's "Interaction with existing features" lists gang-scheduling call sites but not the Kueue backend ([#707](https://github.com/ai-dynamo/grove/pull/707)). The backend's partial-gang rule and base PodGroup count become `init.minReplicas` (§7.3).
 
-Not yet in the GREP: **upgrades into N+1 and later must pass through N** (§3). GREP step 9 should state this with the next GREP update.
+Not yet in the GREP. These go into the next update of #878:
 
-### 11.2 Deferred; must be resolved before PR 1 merges
+- **Upgrades into N+1 and later must pass through N** (§3). GREP step 9 should say so.
+- **`maxUnavailable` is not frozen** (item 8). "Interaction with existing features" says that "a Coherent update freezes the resolved value in its plan when it starts". That is wrong. Every reconcile resolves the value again against the live component's `spec.replicas`, as Deployments do.
+- **CRD delivery is option A** (item 9). GREP step 2 should say that the PodCliqueSet, PodClique and PodCliqueScalingGroup CRDs move to chart templates, which diverges from GREP-436's `crds/` layout for those three kinds.
+- **PodGangMap and ClusterTopologyBinding use `conversion.strategy: None`** (item 10). GREP step 2 lists every kind as converted, without saying how.
 
-Release N is cut right after PR 1 (§8), so none of these can slip to a later release. Each is listed with the commit that needs it.
+### 11.2 Resolved before PR 1
 
-8. **Where the resolved `maxUnavailable` is frozen.** The GREP says a Coherent update "freezes the resolved value in its plan". Today's plan state lives in PodGangMap entries and `status.updateProgress`. If a new status field is needed, for example on `PodCliqueSetReplicaUpdateProgress`, it is a Phase 1 API addition and must be in the v1beta1 schema. **Needed by commit 4.**
-9. **CRD delivery** (§6.1, option A or B). This needs agreement from the GREP-436 owners, and the GREP's step 2 should name the choice. The choice also decides how sticky storage is implemented (§3): option A uses a Helm `lookup` in the CRD templates, and option B relies on the `crdInstaller` alone. **Needed by commit 2; the sticky-storage part by commit 5.**
-10. **Conversion strategy for PodGangMap and ClusterTopologyBinding.** `None` is proposed (§5.1). It also lets their storage switch in N without the webhook (§7.4). The GREP lists all kinds as converted, without saying how. **Needed by commit 2.**
+These were deferred. Release N is cut right after PR 1 (§8), so each needed a decision before the commit that uses it.
+
+8. **`maxUnavailable` is not frozen.** Every reconcile resolves it again against the live component's `spec.replicas`, under `Coherent` as `max(resolved, minReplicas)`. So no new status field is needed, and the v1beta1 schema gains nothing for it. The GREP's "freezes the resolved value in its plan" is wrong and will be fixed (§11.1). §7.3 and §10 follow this. (Commit 4.)
+9. **CRD delivery uses option A** (§6.1). The PodCliqueSet, PodClique and PodCliqueScalingGroup CRDs move to chart templates, with `helm.sh/resource-policy: keep`, a templated `spec.conversion`, a pre-upgrade adoption hook, and a `lookup` that keeps storage sticky (§3). The GREP-436 owners still need to agree to the layout change. (Commit 2; the sticky-storage part in commit 5.)
+10. **PodGangMap and ClusterTopologyBinding use `conversion.strategy: None`** (§5.1). Their schemas are identical, so they never call the webhook, and their storage switches in N without it (§7.4). (Commit 2.)
 
 ### 11.3 `startsAfter` change (outside GREP-0877)
 
@@ -699,10 +716,8 @@ Decided:
 11. **Tracking.** The change is tracked by #859, which leaves the exact API to Grove. Post the `[]StartupDependency` shape (§4.2) and the validation rules (§4.5) there for agreement before commit 4 is written.
 12. **Custom conditions are rejected unless declared as a readiness gate.** A `startsAfter` dependency that names a custom condition must have that condition declared in the parent clique's `spec.readinessGates`, or admission rejects it. Removing a referenced gate later is also rejected, and `DisruptionTarget` is never allowed (§4.5). Workloads that set a condition without a gate must add the gate. This could be relaxed later if needed, whereas tightening after release would have been a breaking change.
 
-Open:
-
-13. **What "every target pod" means.** The requested `ConditionType` comment says the condition must be True "on every target pod". #859 says "all required target Pods". Today's `initc` waits for a count: the parent's `MinAvailable` pods within the dependent pod's own PodGang (finding 12). This plan reads "required" as that count, now `init.minReplicas`, and words the field doc as "on the target pods of the parent". If "every pod of the parent" is really meant, that is a separate behaviour change, because a parent clique can scale beyond its gang minimum. **Needed by commit 4.**
-14. **Snapshot readiness gate.** Confirm on #859 that the Snapshot design declares `PlaceholderAvailable` as a readiness gate on the placeholder pods. If it sets the condition without one, it must add the gate to work with item 12.
+13. **"Target pods" keeps today's behaviour.** A dependency is released once the parent's `init.minReplicas` pods within the dependent pod's own PodGang have the condition `True`. That is today's count with `MinAvailable` renamed (finding 12). It is not "every pod of the parent". The field doc says "on the target pods of the parent" (§4.2).
+14. **The Snapshot design declares `PlaceholderAvailable` as a readiness gate** on the placeholder pods (confirmed). So it works with item 12 unchanged.
 
 ### 11.4 Status-field cleanup (outside GREP-0877)
 
@@ -710,9 +725,9 @@ Decided:
 
 15. **`PodCliqueSetStatus.podGangStatuses` is removed** (§4.3). The `grove.io` copies of `PodGangStatus` and `PodGangPhase` go with it. Nothing ever set or read them. The removal is a separate change on v1alpha1 that lands before PR 1, so the v1beta1 copy never has it. Its release note should mention Go consumers that refer to these types.
 
-Open, from an audit of PCS, PCSG and PCLQ status. Every other field is written, and most are read by the controllers or used by `/scale`, printer columns or e2e:
+From an audit of PCS, PCSG and PCLQ status. Every other field is written, and most are read by the controllers or used by `/scale`, printer columns or e2e:
 
-16. **`PodCliqueSetReplicaUpdateProgress.inFlightEpochs`** is written but never read. Its doc says the orchestrator waits on it, but the coherent update recomputes the epochs from the PodGangMap. Decide whether to drop it from v1beta1 or keep it as an informational mirror with an accurate doc. **Needed by commit 4.**
-17. **Inaccurate status docs to fix in v1beta1:**
+16. **`PodCliqueSetReplicaUpdateProgress.inFlightEpochs` stays unchanged** in v1beta1, both the field and its doc. It is written but not read today, because the coherent update recomputes the epochs from the PodGangMap.
+17. **The inaccurate status docs are fixed in PR 1** (commit 4):
     - `PodCliqueSetStatus.availableReplicas` says availability is based on `MinAvailableBreached`. The code compares ready and available counts against `MinAvailable`, which becomes `ReadyThreshold` (§7.1).
     - `PodCliqueScalingGroupStatus.replicas` says "observed", but it mirrors `spec.replicas`.
