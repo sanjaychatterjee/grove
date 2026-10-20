@@ -1,6 +1,6 @@
 # Implementation Plan: MinAvailable Disaggregation and Promotion to `grove.io/v1beta1`
 
-Source design: GREP-0877: Terminal States, Termination and Restart Policies ([PR #878](https://github.com/ai-dynamo/grove/pull/878), revision `37c2bb8`, at `docs/proposals/0877-termination-and-restart-policies/README.md` on the `terminal-states` branch). This plan details **Phase 1** of the GREP's Implementation Plan. The code references below were checked against upstream `main` at `a5be55f`. It covers the sections "Disaggregating MinAvailable", "API changes", "Defaults", "Validation" and "Migration from legacy fields". Tracking issue: [#877](https://github.com/ai-dynamo/grove/issues/877).
+Source design: GREP-0877: Terminal States, Termination and Restart Policies ([PR #878](https://github.com/ai-dynamo/grove/pull/878), revision `eda4763`, at `docs/proposals/0877-termination-and-restart-policies/README.md` on the `terminal-states` branch). This plan details **Phase 1** of the GREP's Implementation Plan. The code references below were checked against upstream `main` at `a5be55f`. It covers the sections "Disaggregating MinAvailable", "API changes", "Defaults", "Validation" and "Migration from legacy fields", and clarification 15 (when breach evaluation starts). Tracking issue: [#877](https://github.com/ai-dynamo/grove/issues/877).
 
 ## 1. Scope
 
@@ -19,13 +19,14 @@ In scope, but outside GREP-0877 (it rides on the same v1beta1 promotion):
 
 - Change `PodCliqueSpec.startsAfter` from `[]string` to `[]StartupDependency`. Each dependency names a parent clique and the Pod condition that releases it, which defaults to `Ready` (§4.2). Today the release condition is hard-coded to `PodReady`. Tracking issue: [#859](https://github.com/ai-dynamo/grove/issues/859), "Allow startup dependencies to wait for a pre-Ready workload milestone". The motivating case is the multi-Pod Snapshot restore, where target pods cannot become `Ready` until a restore step that itself waits on the dependency. Waiting on `Ready` would deadlock, so the dependency needs an earlier milestone such as `PlaceholderAvailable`.
 - A conversion webhook, so existing `v1alpha1` objects, manifests and Go clients keep working unchanged.
+- `MinAvailableBreached` stays `Unknown` until breach evaluation starts: on a PCLQ until its first schedule (`AwaitingInitialSchedule`), on a PCSG until its first availability (`AwaitingInitialAvailability`). This replaces the `WasPCLQEverScheduled` and `WasPCSGEverHealthy` gates (GREP clarification 15, §7.6).
 
 Unchanged by this plan:
 
 - `PodCliqueSetSpec.updateStrategy`, including its `RollingRecreate` default;
 - `rollingUpdate.progressDeadline`;
 - the placement of `rollingUpdate` (standalone clique templates and PCSG configs);
-- all status types, condition types and reasons;
+- all status types and condition types, and every existing reason. `MinAvailableBreached` gains two `Unknown` reasons (§7.6);
 - the `scheduler.grove.io` group (PodGang), which stays at `v1alpha1`.
 
 Out of scope here (GREP Phase 2, additive to v1beta1):
@@ -35,7 +36,7 @@ Out of scope here (GREP Phase 2, additive to v1beta1):
 - the PCS-level `termination` section;
 - the `Never`/`OnFailure` pod restart policies.
 
-Behavioural contract, the GREP's Phase 1 exit criteria: **every existing `v1alpha1` workload behaves exactly as before.** That covers gang scheduling, gang termination, rolling updates and the scale guard, and the upgrade recreates no pods. New behaviour appears only through fields that `v1alpha1` cannot express.
+Behavioural contract, the GREP's Phase 1 exit criteria: **every existing `v1alpha1` workload behaves exactly as before.** That covers gang scheduling, gang termination, rolling updates and the scale guard, and the upgrade recreates no pods. New behaviour appears only through fields that `v1alpha1` cannot express. The one intended exception is that a PCLQ's breach tolerance is measured from its first schedule rather than from about its creation (§7.6).
 
 ## 2. Findings from the current code
 
@@ -77,6 +78,8 @@ The storage flag is **sticky**: nothing may move it back to v1alpha1 within N.
 - A manual `kubectl apply` of N's manifests would revert it. The runnable watches the CRDs and switches again, and the migrator re-runs; this is self-healing. The upgrade guide says to use the chart or `install-crds`.
 
 From N+1 the marker is on v1beta1 in the source, and the switch runnable is a no-op. It is deleted in N+3.
+
+**Upgrades must pass through N.** Only N switches storage and migrates objects, and only N carries over the PCSG awaiting state (§7.6). Therefore N+1 and later support upgrades only from N or later, and the release notes say so. Upgrading straight from N-1 would leave objects stored at v1alpha1, which N+3 can no longer read.
 
 The Phase 1 v1beta1 schema must be final when N is cut. All of it lands in one PR, after which N is cut (§8).
 
@@ -169,7 +172,7 @@ type StartupDependency struct {
 
 - `listType=map` keyed by `name` makes duplicate names a schema error and lets server-side apply merge entries by name. The v1alpha1 `[]string` stays atomic. Each version has its own schema, so the two list types can differ.
 - `ConditionType` is a plain `string`, as requested. It is validated as a Kubernetes qualified name (§4.5). It is either a built-in Pod condition or a custom condition that the parent clique declares in `readinessGates`, such as `example.com/model-loaded`.
-- The "target pods" are the number of parent pods the dependent pod waits for, which is the parent's `init.minReplicas` within the pod's own PodGang. It is not every pod of the parent (finding 12; §11 item 10).
+- The "target pods" are the number of parent pods the dependent pod waits for, which is the parent's `init.minReplicas` within the pod's own PodGang. It is not every pod of the parent (finding 12; §11 item 13).
 
 How the design meets the required semantics of [#859](https://github.com/ai-dynamo/grove/issues/859):
 
@@ -227,7 +230,7 @@ The CA (completion-aware) column of the GREP table (`init.minReplicas: spec.repl
 - **Autoscaling:** `scaleConfig.minReplicas ≥ availability.minReplicas`. This replaces the current `≥ minAvailable`.
 - **`rollingUpdate` rules:** today's rules stay, with `minReplicas` in place of `minAvailable` (`validateRollingUpdateConfiguration` in `pcs/validation/podcliqueset.go`):
   - `rollingUpdate` is rejected on a PCSG-member clique template;
-  - `maxUnavailable` must be an integer `≥ 1` or a percentage in `[1%, 100%]`. There is no upper bound against `replicas`. [#884](https://github.com/ai-dynamo/grove/pull/884) removed it because the live PCLQ or PCSG is scaled independently of the template through `/scale`, and runtime planning already caps disruption at the replicas that remain. The GREP's validation section still says `[1, replicas]` and should be aligned (§11);
+  - `maxUnavailable` must be an integer `≥ 1` or a percentage in `[1%, 100%]`. There is no upper bound against `replicas`. [#884](https://github.com/ai-dynamo/grove/pull/884) removed it because the live PCLQ or PCSG is scaled independently of the template through `/scale`, and runtime planning already caps disruption at the replicas that remain. The GREP's validation section still says `[1, replicas]` and should be aligned (§11.1);
   - under `Coherent`, the resolved `maxUnavailable` must be `≥ rollingUpdate.minReplicas`, and the controllers also use `max(resolved, minReplicas)` at run time;
   - `rollingUpdate.minReplicas` is rejected under `RollingRecreate`, and all of `rollingUpdate` is rejected under `OnDelete`, as today.
 - **Immutable:** `init.minReplicas`, `rollingUpdate.minReplicas` and `availability.minReplicas`. Adding or removing `availability` is also rejected, because it switches gang termination on or off (§11 item 2).
@@ -243,7 +246,7 @@ The CA (completion-aware) column of the GREP table (`init.minReplicas: spec.repl
   - It must be a valid qualified name (`validation.IsQualifiedName`). Qualified names cannot contain `:`, which keeps the init-container argument format unambiguous (§7.3).
   - The built-in Pod conditions `PodScheduled`, `PodReadyToStartContainers`, `Initialized`, `ContainersReady` and `Ready` are always allowed, because the scheduler and kubelet set them.
   - `DisruptionTarget` is rejected. The control plane sets it when a pod is about to be evicted or preempted, so it would release dependents just as the parent goes away.
-  - **Any other (custom) condition is rejected unless the parent clique template's pod spec declares it in `spec.readinessGates`.** The parent may be a standalone clique or a PCSG member; its template is in the same PodCliqueSet. The error names the dependency, the condition and the parent clique. This catches typos at admission. Because `startsAfter` is immutable, a typo would otherwise mean deleting and recreating the PodCliqueSet (§11 item 11).
+  - **Any other (custom) condition is rejected unless the parent clique template's pod spec declares it in `spec.readinessGates`.** The parent may be a standalone clique or a PCSG member; its template is in the same PodCliqueSet. The error names the dependency, the condition and the parent clique. This catches typos at admission. Because `startsAfter` is immutable, a typo would otherwise mean deleting and recreating the PodCliqueSet (§11 item 12).
 - **Readiness gates referenced by `startsAfter` cannot be removed.** The parent's pod template stays mutable, so on update the webhook re-runs the rule above against the new template. It rejects a template change that drops a readiness gate still named by a dependent's `startsAfter`. Otherwise an update could recreate the parent pods without the gate, and the dependents would wait forever.
 - **`startsAfter` is immutable,** including each `conditionType`, as today (`ValidateImmutableField` in the PCS update path).
 - **Scale guard** (`scaleguard.go`): `spec.replicas` must be `0` or `≥ availability.minReplicas`, falling back to `init.minReplicas` when `availability` is nil. The anchor `PodGroup.minReplicas` is clamped to `min(init.minReplicas, replicas)`.
@@ -429,7 +432,7 @@ Switch the alias `grovecorev1alpha1` to `grovecorev1beta1` across `operator/inte
 | `podclique/reconciler.go` resync interval | PCS `TerminationDelay` | the PCLQ's `BreachTolerance` |
 | `podcliqueset/components/podcliquesetreplica/rollingupdate.go` scheduled-pod count | member `MinAvailable` | `InitMinReplicas` |
 | `utils/component/rollingupdate.go` `EffectiveMaxUnavailable`, `CoherentMinAvailableByComponent`, `CoherentMaxUnavailableByComponent` | `MinAvailable`, int32 `MaxUnavailable` | `UpdateMinReplicas`, `ResolvedMaxUnavailable` |
-| `podgangmap/syncflow.go` `computeMVUTemplate` | `MinAvailable` (via `CoherentMinAvailableByComponent`) | `UpdateMinReplicas`; the resolved `maxUnavailable` is frozen in the plan when the update starts (deferred, §11 item 7) |
+| `podgangmap/syncflow.go` `computeMVUTemplate` | `MinAvailable` (via `CoherentMinAvailableByComponent`) | `UpdateMinReplicas`; the resolved `maxUnavailable` is frozen in the plan when the update starts (deferred, §11 item 8) |
 | `podgangmap/substepplanner.go` (anchor-bearing step targets and the per-sub-step budget) | `CoherentMinAvailableByComponent`, `CoherentMaxUnavailableByComponent` | no direct change; it consumes the two helpers above |
 | `scheduler/kueue/backend.go` `basePodGangPodGroupCount` | PCSG `MinAvailable` | `InitMinReplicas` (PCSG) |
 | `scheduler/kueue/backend.go` partial-gang rejection (`0 < minAvailable < replicas`) | clique `MinAvailable` | `InitMinReplicas`. Its comment "a nil minAvailable defaults to replicas" is wrong today (the schema default is `1`) and becomes moot, because `init.minReplicas` is always set after defaulting. |
@@ -440,7 +443,10 @@ Switch the alias `grovecorev1alpha1` to `grovecorev1beta1` across `operator/inte
 | `webhook/admission/scaleguard/scaleguard.go` | `MinAvailable` | §4.5 rule |
 | `webhook/admission/pcs/defaulting`, `pcs/validation` | `MinAvailable`, `TerminationDelay` (`defaultTerminationDelay`), int32 `MaxUnavailable` | rewritten per §4.4–4.5; `defaultTerminationDelay` becomes the `breachTolerance` default |
 | `webhook/admission/pclq/validation/handler.go` `decodeReplicas` (Kueue scale validation, #707) | decodes `grovecorev1alpha1.PodClique` | decodes `grovecorev1beta1.PodClique`, in commit 2 (§6.3) |
-| `api/common/constants/constants.go` | doc comments | comments only; condition and reason values unchanged |
+| `api/common/constants/constants.go` | doc comments | comments, plus the two new reasons `ConditionReasonAwaitingInitialSchedule` and `ConditionReasonAwaitingInitialAvailability` (§7.6); existing values unchanged |
+| `podclique/reconcilestatus.go` and `podcliquescalinggroup/reconcilestatus.go` `computeMinAvailableBreachedCondition` | `Unknown` only during updates | awaiting states first (§7.6) |
+| `podcliquescalinggroup/reconcilestatus.go` `computeNotInBreachReplicas` | member breached if `MinAvailableBreached=True` | also if `Unknown` with `AwaitingInitialSchedule` (§7.6) |
+| `utils/component/podclique.go` `WasPCLQEverScheduled`, `WasPCSGEverHealthy`, `InitialScheduleGrace`, and their uses in `GetMinAvailableBreachedPCLQInfo` and `gangterminate.go` | gate gang termination | deleted from the gang-termination paths: an awaiting resource is never `True` (§7.6). `WasPCSGEverHealthy` survives only as the PCSG upgrade carry-over and is deleted in PR 2. |
 | `api/core/v1beta1` `TopologyConstraint.RequiredDomain`, `HasAnyPackDomain` | fall back to `PackDomain` | read `pack` only |
 | `webhook/admission/pcs/validation/topologyconstraints.go` (`packDomain` warning, domain check, migration and immutability rules) | `PackDomain` | the `packDomain` branches are deleted; immutability compares `pack` only |
 | `utils/component/topologyconstraint.go`, `podgang/syncflow.go` | via `RequiredDomain()` | unchanged call sites; the helper now reads `pack` only |
@@ -475,15 +481,47 @@ After N is up, a plain downgrade fails for two reasons. The API server refuses N
 
 The procedure is idempotent and safe to re-run. It is documented in the release notes and covered by e2e (§9). Values that v1alpha1 cannot express are lost to N-1. Examples are `init.minReplicas` ≠ `availability.minReplicas`, per-component `breachTolerance`, and custom `startsAfter` conditions. Upgrading back to N restores them from the annotation.
 
+### 7.6 Start of breach evaluation (GREP clarification 15)
+
+`MinAvailableBreached` stays `Unknown` until breach evaluation starts, so a resource that has never been scheduled or available is never `True`. This replaces today's gates in `utils/component/podclique.go`:
+- `WasPCLQEverScheduled` reads `status.lastScheduled`;
+- `WasPCSGEverHealthy` reads the PCSG condition with a 5-second grace (`InitialScheduleGrace`), and counts an `Unknown` to `True` transition as healthy.
+
+The awaiting states apply only when `availability` is set; otherwise the condition is permanently `False`. The PCS has no `MinAvailableBreached` in Phase 1, so its `AwaitingInitialAvailability` arrives with PCS availability in Phase 2.
+
+**PodClique** (`computeMinAvailableBreachedCondition` in `podclique/reconcilestatus.go`):
+
+- The new first branch, ahead of the update and scale-to-zero branches, returns `Unknown` with reason `AwaitingInitialSchedule` while `status.lastScheduled` is nil. `lastScheduled` is already the durable marker of the first schedule and is never reset, so this state needs no upgrade carry-over. A PCLQ that N-1 has seen scheduled reads correctly on N's first reconcile.
+- The existing branches follow unchanged. The scheduled-below-minimum branch now fires only on a regression.
+- **Timing change.** `meta.SetStatusCondition` stamps `lastTransitionTime` on the `Unknown` to `True` transition, so a clique that is scheduled but never ready is `True` from its first schedule, and is gang-terminated `breachTolerance` after that. Today it is `True` from about creation, and is gang-terminated once scheduled if the delay has already passed. A clique that is already `True` at upgrade keeps its `lastTransitionTime` and its timing.
+- **Restarts.** In Phase 1, gang termination and the PCSG replica recycle delete and recreate PCLQ objects, so a recreated clique starts awaiting. Phase 2's resource-scope restart must also clear `lastScheduled`; this goes into the Phase 2 plan.
+
+**PodCliqueScalingGroup** (`computeMinAvailableBreachedCondition` in `podcliquescalinggroup/reconcilestatus.go`):
+
+- While the PCSG has not left the awaiting state, it reports `Unknown` with reason `AwaitingInitialAvailability`. That holds during an update, when it is scaled to zero, and while its not-in-breach replicas are below `availability.minReplicas`. The first evaluation at or above the minimum, outside an update, writes `False` and leaves the state. After that, today's branches apply.
+- **Has it left the awaiting state?** It is read from the previous condition, with no new status field. `False` or `Unknown` with `UpdateInProgress` means it has left, and `Unknown` with an awaiting reason, or no condition at all, means it has not. `True` means it has left only if `WasPCSGEverHealthy` passes.
+- **Why that rule is safe.**
+  - N never writes `True` or `UpdateInProgress` before the first availability, so for conditions written by N the rule is exact. The one exception is a PCSG that becomes available and then breaches within 5 seconds of its creation. Today's gate also treats that PCSG as never healthy.
+  - For conditions written by N-1, it is today's gate. So on upgrade, no PCSG is gang-terminated that N-1 would have spared, and none is spared that N-1 would have terminated.
+  - Upgrades must pass through N (§3), so every PCSG has been reconciled by N before N+1 runs, and PR 2 deletes `WasPCSGEverHealthy` and `InitialScheduleGrace`.
+- **`computeNotInBreachReplicas`.** A replica is in breach if any member PCLQ is `True` or still `AwaitingInitialSchedule`. A never-scheduled member is `True` today, so the PCSG counts are unchanged. Without this rule, an awaiting member would look healthy, and the PCSG would leave its own awaiting state before its members were placed.
+
+**Consumers:**
+
+- `GetMinAvailableBreachedPCLQInfo` drops its `WasPCLQEverScheduled` filter, and `gangterminate.go` drops its `WasPCSGEverHealthy` filter. An awaiting resource is never `True`, so both filters are redundant.
+- The PCSG replica recycle in `podcliquescalinggroup/components/podclique/sync.go` already uses `GetMinAvailableBreachedPCLQInfo`, so it is covered.
+- The `MinBreached` printer column on `pclq` and `pcsg` now shows `Unknown` during startup instead of `True`. The release notes say so (§8 commit 8), because scripts that wait on `True` during startup see a change.
+- **Lost status.** If an object's status is lost, for example when it is restored from a backup without status, it starts awaiting again. A PCLQ leaves the state again as soon as its pods are seen scheduled. A PCSG leaves only at its next availability, which is also how `WasPCSGEverHealthy` behaves today.
+
 ## 8. PR sequence
 
 All Phase 1 work for release N lands as **one PR**. Release N is cut right after it merges. Numbers in brackets are the GREP's Phase 1 steps.
 
 | PR | Content | Behaviour change |
 |---|---|---|
-| **0** | Merge GREP-0877 ([#878](https://github.com/ai-dynamo/grove/pull/878)), folding in the GREP feedback from §11. | None |
+| **0** | Merge GREP-0877 ([#878](https://github.com/ai-dynamo/grove/pull/878)). Revision `eda4763` already includes the §11.1 feedback. | None |
 | **1** [1–8, 10] | The complete v1beta1 promotion, Phase 1 field split, `startsAfter` change, storage switch, tests and docs, as the ordered commits below. **Cut release N** after it merges. | v1alpha1: none. v1beta1-native: new semantics. Storage moves to v1beta1. |
-| **2** | Release N+1: move `+kubebuilder:storageversion` to v1beta1 in the source, which makes the switch runnable a no-op. | None |
+| **2** | Release N+1: move `+kubebuilder:storageversion` to v1beta1 in the source, which makes the switch runnable a no-op. Delete `WasPCSGEverHealthy` and `InitialScheduleGrace`, the PCSG upgrade carry-over (§7.6). | None |
 | **3** [9] | Release N+3, after the two-release window (N+1, N+2): stop serving v1alpha1 and remove it from the CRDs through the GREP-436 upgrader. Delete the v1alpha1 package, the conversion code, the v1alpha1 CEL rules, the storage switch and `downgrade-storage`. | Breaking for v1alpha1 clients |
 
 PR 1 is organized as eight commits, in this order. **Each commit builds and passes the unit tests on its own**, so the PR can be reviewed and bisected commit by commit.
@@ -493,11 +531,11 @@ PR 1 is organized as eight commits, in this order. **Each commit builds and pass
 | **1** [1] | Accessor layer (§7.1) on v1alpha1, with unit tests that pin today's values. It includes `StartupDependencies`, plus `initc` support for the optional `:<conditionType>` argument (it parses but never emits it yet). | None |
 | **2** [2] | v1beta1 package as an identical copy of v1alpha1, plus `Hub()`. Trivial generated conversion. Multi-version CRDs (storage v1alpha1). `/convert`. CRD `spec.conversion` (§6.1). `caBundle` injection and RBAC (§6.2). **Webhook rules switched to v1beta1 with `Equivalent`**, and `internal/webhook/...` handlers moved to v1beta1 types (§6.3). | None. The schemas are identical. |
 | **3** [3] | Mechanical import switch (§7.2) and regenerated clients. | None |
-| **4** [4, 5, 6] | v1beta1 schema (§4.2–4.3), including dropping `packDomain` and the `[]StartupDependency` form of `startsAfter`. Hand-written conversion with the stash (§5.2–5.3), plus fuzz and table tests. v1alpha1 CEL rules. Deprecation markers. Accessors on v1beta1 fields. Defaulting and validation, including the immutability exception (§4.4–4.5). Scale guard. Per-component `breachTolerance`. Percentage `maxUnavailable` in update orchestration. `startsAfter` validation, and the per-dependency condition type passed to and enforced by `initc`. Printer columns. | v1alpha1: none. v1beta1-native: new semantics. |
+| **4** [4, 5, 6] | v1beta1 schema (§4.2–4.3), including dropping `packDomain` and the `[]StartupDependency` form of `startsAfter`. Hand-written conversion with the stash (§5.2–5.3), plus fuzz and table tests. v1alpha1 CEL rules. Deprecation markers. Accessors on v1beta1 fields. Defaulting and validation, including the immutability exception (§4.4–4.5). Scale guard. Per-component `breachTolerance`. Percentage `maxUnavailable` in update orchestration. `startsAfter` validation, and the per-dependency condition type passed to and enforced by `initc`. `MinAvailableBreached` awaiting states, with the PCSG upgrade carry-over (§7.6). Printer columns. | v1alpha1: none, except that `MinAvailableBreached` is `Unknown` during startup and a PCLQ's breach tolerance runs from its first schedule (§7.6). v1beta1-native: new semantics. |
 | **5** [8] | Storage switch and migrator (§7.4), the sticky-storage handling in the `crdInstaller` and the chart (§3), and the downgrade procedure (§7.5). | Storage only |
 | **6** [10] | Envtest and e2e from §9: upgrade from N-1 under live traffic, downgrade to N-1, operator restarts, the equivalence suites with v1alpha1 and v1beta1 manifests, Story 1 and the #859 scenario. | — |
 | **7** [7] | Docs and samples:<br>- `docs/api-reference` (add v1beta1 to `hack/generate-api-docs.sh`);<br>- user guide and samples on v1beta1, keeping one v1alpha1 sample. This includes the startup-ordering samples (`simple2`/`simple3-explicit-startup-order.yaml`) and the e2e workloads that use `startsAfter`;<br>- a migration guide with the §5.2 table. | — |
-| **8** | Release notes covering the downgrade procedure (§7.5), the v1alpha1 removal in N+3, and Go consumers such as Dynamo. | — |
+| **8** | Release notes covering the downgrade procedure (§7.5), the v1alpha1 removal in N+3, upgrades into N+1 and later only from N (§3), `MinAvailableBreached=Unknown` during startup and the breach-timing change (§7.6), and Go consumers such as Dynamo. | — |
 
 The schema change, the conversion and the call-site migration are a single commit (4). Removing `minAvailable` breaks every call site that commit 1 has not already routed through an accessor, so they cannot build separately. Commit 1 is what keeps commit 4 reviewable. The mechanical import switch stays isolated in commit 3, so reviewers can check it as a pure rename.
 
@@ -538,6 +576,13 @@ What one PR changes compared with a PR series:
     - an update that removes a referenced readiness gate from the parent's pod template is rejected, while removing an unreferenced gate is accepted;
   - a v1alpha1 update that moves `packDomain` to `pack.required` is accepted as an identity change.
 - **Ready threshold:** `ReadyThreshold` is `availability.minReplicas` when set, and `init.minReplicas` when `availability` is nil.
+- **Awaiting states** (§7.6):
+  - PCLQ: with `lastScheduled` nil, the condition is `Unknown`/`AwaitingInitialSchedule`, even during an update or at `replicas: 0`. Once scheduled, today's `True`/`False` results follow, and the first `True` has its `lastTransitionTime` at the schedule. An existing `True` keeps its `lastTransitionTime`.
+  - PCSG transitions: none or awaiting stays awaiting during an update, at `replicas: 0` and below the minimum. Awaiting goes to `False` at the minimum. After that, today's logic applies.
+  - PCSG carry-over, one case per N-1 condition shape: `False`; `True` with `lastTransitionTime` before and after the 5-second grace; `Unknown`/`UpdateInProgress`.
+  - `computeNotInBreachReplicas` counts a replica with an awaiting member as in breach.
+  - `GetMinAvailableBreachedPCLQInfo` and `gangterminate.go` never select an awaiting PCLQ or PCSG.
+  - With `availability` nil, the condition is `False` in all of these cases.
 - **Accessor parity:** at commit 1, the accessors return today's values; at commit 4, they return the same values for converted objects.
 - **Phase 2 safety:** neither conversion nor the stash ever produces a `restart` field (§5.4).
 - **Chart:** no `grove.io` webhook rule uses `Exact`, and every rule includes v1beta1.
@@ -558,6 +603,7 @@ What one PR changes compared with a PR series:
     - pod UIDs, `CurrentGenerationHash` and PodGangs are unchanged;
     - objects read correctly at both versions;
     - a PCLQ breach still gang-terminates after the original delay;
+    - a PCSG that was never healthy at the upgrade is not gang-terminated, and a PCSG that was healthy and then breached is gang-terminated after the delay (§7.6);
     - the storage switch happens only after `/convert` is ready, the migrator completes, and `storedVersions == ["v1beta1"]`.
 - **Upgrade under load:** during the N-1 → N upgrade, a client keeps writing v1alpha1 PodCliqueSets while the N-1 operator keeps reconciling. No write fails apart from ordinary conflicts. That holds because storage stays v1alpha1 until N serves `/convert` (§3).
 - **Sticky storage:** re-running the `crdInstaller` init container and running `helm upgrade` with changed values both leave storage on v1beta1. A manual `kubectl apply` of N's CRDs is switched back by the runnable, and the migrator re-runs.
@@ -566,6 +612,7 @@ What one PR changes compared with a PR series:
 - **Equivalence:** `gang_termination_test.go`, `scaleguard_test.go`, `gang_scheduling_test.go` and the `update/` suite pass with v1alpha1 manifests and again with equivalent v1beta1 manifests.
 - **New v1beta1 behaviour:**
   - Story 1: `init.minReplicas: 8` with `availability.minReplicas: 6` tolerates the loss of 2 pods without gang termination.
+  - A PodCliqueSet that cannot be scheduled shows `MinBreached` `Unknown` on its PCLQs and PCSGs and is never gang-terminated. A clique that is scheduled but never becomes ready is gang-terminated `breachTolerance` after its first schedule (§7.6).
   - A PCSG whose members have no `availability` counts a replica as available only once each member has `init.minReplicas` ready pods.
   - A Coherent update with `rollingUpdate.minReplicas` larger than `availability.minReplicas` rolls in the larger unit.
   - A percentage `maxUnavailable` is resolved correctly before and after scaling.
@@ -599,6 +646,9 @@ What one PR changes compared with a PR series:
 | **v1alpha1 users see v1beta1 field paths in errors** | v1alpha1 CEL rules for the common errors (§4.5). |
 | **A custom `startsAfter` condition is never set, so dependent pods stay in `Init` forever** | Admission rejects custom conditions that the parent doesn't declare in `readinessGates`, and rejects removing a referenced gate (§4.5). That catches typos and drift. A declared gate that nothing sets also keeps the parent from becoming `Ready`, so the problem shows up on the parent rather than only on the dependents. The `initc` logs the condition it is waiting on, and the user guide documents the pattern. |
 | **Requiring a readiness gate changes what `Ready` means for the parent** | This is intended: the milestone is "below `Ready`" (#859). The user guide states that the workload's agent must set the condition on every start, not only on restore. |
+| **Clients rely on `MinAvailableBreached=True` during startup** (scripts, dashboards, `kubectl wait`) | Release notes (§8 commit 8). Grove's own consumers change in the same commit (§7.6). The awaiting reasons name the state explicitly. |
+| **An upgrade gang-terminates, or spares, a PCSG differently from N-1** | The carry-over reads N-1 conditions with today's `WasPCSGEverHealthy` (§7.6), covered by unit cases per condition shape and by the upgrade e2e. |
+| **A user upgrades from N-1 directly to N+1 or later** | Not supported (§3), and the release notes say so. The carry-over and the storage migration exist only in N. |
 | **Init-container args change for existing workloads on upgrade** | The `Ready` condition is never written into the args, so pods created by N for converted workloads match N-1. Running pods keep their original `initc` image and args. |
 
 ## 11. Open questions and GREP feedback
@@ -613,28 +663,56 @@ Resolved by GREP revision `37c2bb8`, versus the first draft of this plan:
 - PCSG members use `init.minReplicas` as the update threshold;
 - the conversion annotation is named `grove.io/v1beta1-conversion-data`.
 
-Decided for this plan. The GREP should be updated to match, on [#878](https://github.com/ai-dynamo/grove/pull/878):
+### 11.1 Decided for this plan, and folded into the GREP
+
+This feedback for [#878](https://github.com/ai-dynamo/grove/pull/878) is in GREP revision `eda4763`, together with clarification 15, the awaiting states (§7.6). The items are kept here for reference:
 
 1. **Ready threshold when `availability` is nil is `init.minReplicas`.** The resource counts as available once its gang-scheduled minimum is ready (§7.1). The GREP should define `ReadyThreshold` alongside clarification 12.
 2. **Adding or removing `availability` is rejected** (§4.5). The GREP's immutable-fields list should say so.
 3. **`breachTolerance` on converted PCLQ and PCSG objects comes from the PCS-level v1alpha1 `template.terminationDelay`** (§5.2). The value is resolved through the owning PCS, because conversion is pure. The GREP's migration table should add this to its `terminationDelay` row.
 4. **`packDomain` is dropped from v1beta1** and converted to `pack.required` (§4.3, §5.2, §5.3). The GREP's API changes and migration table should list it.
 5. **v1alpha1 is served for two releases after the storage migration**: N+1 and N+2, with removal in N+3 (§3). This fills in GREP step 9.
-6. **Introduction and storage switch are combined into one release, N** (§3). The GREP's steps 7 and 8 put the storage switch one release after v1beta1 is introduced, so the GREP should be updated. Three mechanisms replace the free rollback that the extra release gave: a staged switch performed by the operator once `/convert` is serving, sticky storage, and the downgrade procedure (§7.5).
+6. **Introduction and storage switch are combined into one release, N** (§3). The GREP's steps 7 and 8 put the storage switch one release after v1beta1 is introduced, so the GREP should be updated. Three mechanisms replace the free rollback that the extra release gave: a staged switch performed by the operator once `/convert` is serving, sticky storage (§3), and the downgrade procedure (§7.5).
+7. **All release-N work lands as one PR** of eight ordered commits, after which N is cut (§8). The commits keep the GREP's Phase 1 step order. The GREP's implementation plan should say that steps 1–8 and 10 may land together, as long as each step remains a separately buildable commit.
 
-GREP text that is out of date relative to `main`:
+The GREP text was also out of date with `main` on two points, and `eda4763` fixes both:
 
 - **`maxUnavailable` upper bound.** The GREP's validation section requires `[1, replicas]`. [#884](https://github.com/ai-dynamo/grove/pull/884) removed that bound, so the rule should read "integer `≥ 1` or percentage in `[1%, 100%]`" (§4.5). The GREP's "percentage of the component's `spec.replicas`" should say the *live* component's `spec.replicas`.
 - **Kueue backend.** The GREP's "Interaction with existing features" lists gang-scheduling call sites but not the Kueue backend ([#707](https://github.com/ai-dynamo/grove/pull/707)). The backend's partial-gang rule and base PodGroup count become `init.minReplicas` (§7.3).
 
-Deferred, to be revisited before the PRs that need them:
+Not yet in the GREP: **upgrades into N+1 and later must pass through N** (§3). GREP step 9 should state this with the next GREP update.
 
-7. **Where the resolved `maxUnavailable` is frozen.** The GREP says a Coherent update "freezes the resolved value in its plan". Today's plan state lives in PodGangMap entries and `status.updateProgress`. If a new status field is needed, for example on `PodCliqueSetReplicaUpdateProgress`, it is a Phase 1 API addition and must be in the v1beta1 schema before release N. **Needed by commit 4.**
-8. **CRD delivery** (§6.1, option A or B). This needs agreement from the GREP-436 owners, and the GREP's step 2 should name the choice. **Needed by commit 2.**
-9. **Conversion strategy for PodGangMap and ClusterTopologyBinding.** `None` is proposed (§5.1). The GREP lists all kinds as converted, without saying how. **Needed by commit 2.**
+### 11.2 Deferred; must be resolved before PR 1 merges
 
-Open, for the `startsAfter` change ([#859](https://github.com/ai-dynamo/grove/issues/859), outside GREP-0877):
+Release N is cut right after PR 1 (§8), so none of these can slip to a later release. Each is listed with the commit that needs it.
 
-10. **What "every target pod" means.** The requested `ConditionType` comment says the condition must be True "on every target pod". #859 says "all required target Pods". Today's `initc` waits for a count: the parent's `MinAvailable` pods within the dependent pod's own PodGang (finding 12). This plan reads "required" as that count, now `init.minReplicas`, and words the field doc as "on the target pods of the parent". If "every pod of the parent" is really meant, that is a separate behaviour change, because a parent clique can scale beyond its gang minimum.
-11. **Custom conditions: decided, reject.** A `startsAfter` dependency that names a custom condition must have that condition declared in the parent clique's `spec.readinessGates`, or admission rejects it. Removing a referenced gate later is also rejected, and `DisruptionTarget` is never allowed (§4.5). Workloads that set a condition without a gate must add the gate. This could be relaxed later if needed; tightening after release would have been a breaking change. Confirm on [#859](https://github.com/ai-dynamo/grove/issues/859) that the Snapshot design declares `PlaceholderAvailable` as a readiness gate.
-12. **Tracking: decided.** The change is tracked by [#859](https://github.com/ai-dynamo/grove/issues/859). The issue leaves the exact API to Grove, so the `[]StartupDependency` shape should be posted there for agreement before commit 4 is written. The field must be in the v1beta1 schema when release N is cut.
+8. **Where the resolved `maxUnavailable` is frozen.** The GREP says a Coherent update "freezes the resolved value in its plan". Today's plan state lives in PodGangMap entries and `status.updateProgress`. If a new status field is needed, for example on `PodCliqueSetReplicaUpdateProgress`, it is a Phase 1 API addition and must be in the v1beta1 schema. **Needed by commit 4.**
+9. **CRD delivery** (§6.1, option A or B). This needs agreement from the GREP-436 owners, and the GREP's step 2 should name the choice. The choice also decides how sticky storage is implemented (§3): option A uses a Helm `lookup` in the CRD templates, and option B relies on the `crdInstaller` alone. **Needed by commit 2; the sticky-storage part by commit 5.**
+10. **Conversion strategy for PodGangMap and ClusterTopologyBinding.** `None` is proposed (§5.1). It also lets their storage switch in N without the webhook (§7.4). The GREP lists all kinds as converted, without saying how. **Needed by commit 2.**
+
+### 11.3 `startsAfter` change (outside GREP-0877)
+
+Tracked by [#859](https://github.com/ai-dynamo/grove/issues/859), not by #878.
+
+Decided:
+
+11. **Tracking.** The change is tracked by #859, which leaves the exact API to Grove. Post the `[]StartupDependency` shape (§4.2) and the validation rules (§4.5) there for agreement before commit 4 is written.
+12. **Custom conditions are rejected unless declared as a readiness gate.** A `startsAfter` dependency that names a custom condition must have that condition declared in the parent clique's `spec.readinessGates`, or admission rejects it. Removing a referenced gate later is also rejected, and `DisruptionTarget` is never allowed (§4.5). Workloads that set a condition without a gate must add the gate. This could be relaxed later if needed, whereas tightening after release would have been a breaking change.
+
+Open:
+
+13. **What "every target pod" means.** The requested `ConditionType` comment says the condition must be True "on every target pod". #859 says "all required target Pods". Today's `initc` waits for a count: the parent's `MinAvailable` pods within the dependent pod's own PodGang (finding 12). This plan reads "required" as that count, now `init.minReplicas`, and words the field doc as "on the target pods of the parent". If "every pod of the parent" is really meant, that is a separate behaviour change, because a parent clique can scale beyond its gang minimum. **Needed by commit 4.**
+14. **Snapshot readiness gate.** Confirm on #859 that the Snapshot design declares `PlaceholderAvailable` as a readiness gate on the placeholder pods. If it sets the condition without one, it must add the gate to work with item 12.
+
+### 11.4 Status-field cleanup (outside GREP-0877)
+
+Decided:
+
+15. **`PodCliqueSetStatus.podGangStatuses` is removed** (§4.3). The `grove.io` copies of `PodGangStatus` and `PodGangPhase` go with it. Nothing ever set or read them. The removal is a separate change on v1alpha1 that lands before PR 1, so the v1beta1 copy never has it. Its release note should mention Go consumers that refer to these types.
+
+Open, from an audit of PCS, PCSG and PCLQ status. Every other field is written, and most are read by the controllers or used by `/scale`, printer columns or e2e:
+
+16. **`PodCliqueSetReplicaUpdateProgress.inFlightEpochs`** is written but never read. Its doc says the orchestrator waits on it, but the coherent update recomputes the epochs from the PodGangMap. Decide whether to drop it from v1beta1 or keep it as an informational mirror with an accurate doc. **Needed by commit 4.**
+17. **Inaccurate status docs to fix in v1beta1:**
+    - `PodCliqueSetStatus.availableReplicas` says availability is based on `MinAvailableBreached`. The code compares ready and available counts against `MinAvailable`, which becomes `ReadyThreshold` (§7.1).
+    - `PodCliqueScalingGroupStatus.replicas` says "observed", but it mirrors `spec.replicas`.
