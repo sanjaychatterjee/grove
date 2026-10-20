@@ -10,6 +10,7 @@ In scope (GREP Phase 1):
   - `init.minReplicas` for gang scheduling;
   - `rollingUpdate.minReplicas` for the Coherent minimum update unit, on standalone PCLQs and PCSGs only, and only under `Coherent`;
   - `termination.resource.availability.minReplicas` for the availability floor.
+- Make the three fields mutable at v1beta1, each with its own effect (§7.7). `v1alpha1` `minAvailable` stays immutable.
 - Replace the PCS-wide `template.terminationDelay` with a per-component `termination.resource.availability.breachTolerance`.
 - Change `rollingUpdate.maxUnavailable` from `int32` to int-or-percentage.
 - Drop the deprecated `topologyConstraint.packDomain` from v1beta1. Conversion maps it to `pack.required`.
@@ -47,7 +48,7 @@ Behavioural contract, the GREP's Phase 1 exit criteria: **every existing `v1alph
 5. **Webhook certificates are managed by OPA cert-controller** (`internal/controller/cert/cert.go`) in `auto` mode, and by cert-manager in `manual` mode. cert-controller supports a `CRDConversion` webhook type for `caBundle` injection.
 6. **About 267 Go files import `operator/api/core/v1alpha1`**, which is why the import switch is its own mechanical commit (GREP step 3, §8 commit 3).
 7. **About 30 non-test call sites read `MinAvailable`, `TerminationDelay` or the int32 `MaxUnavailable`.** These include the Kueue scheduler backend ([#707](https://github.com/ai-dynamo/grove/pull/707)) and the Coherent sub-step planner. §7.3 maps each one to a purpose.
-8. **`updateStrategy.type` is mutable today**, with no immutability check in `pcs/validation`. That is why the GREP needs the immutability exception for `rollingUpdate.minReplicas` when the strategy changes to or from `Coherent` (§4.5).
+8. **`updateStrategy.type` is mutable today**, with no immutability check in `pcs/validation`. That is why a strategy change must be allowed to add or remove `rollingUpdate.minReplicas` (§4.5).
 9. **The PCSG object has no `rollingUpdate`.** The PCSG and PCLQ controllers read the update config from the PCS template (`rollingUpdateConfigForPCSG`, `rollingUpdateConfigForPCLQ`). Only `init` and `termination` are copied into PCSG and PCLQ objects, as the GREP specifies.
 10. **`mirrorPCSMetadata` copies PCS annotations onto PodGangs** (`podcliqueset/components/podgang/podgang.go`). The conversion annotation exists only in v1alpha1 representations, and the operator reads v1beta1, so it is never propagated. A test pins this.
 11. **There is already an upgrade e2e test**, `Test_VUPG1_UpgradeFromLatestGitHubRelease` in `operator/e2e/tests/upgrade`. It is the home for upgrade and rollback tests.
@@ -233,9 +234,14 @@ The CA (completion-aware) column of the GREP table (`init.minReplicas: spec.repl
   - `maxUnavailable` must be an integer `≥ 1` or a percentage in `[1%, 100%]`. There is no upper bound against `replicas`. [#884](https://github.com/ai-dynamo/grove/pull/884) removed it because the live PCLQ or PCSG is scaled independently of the template through `/scale`, and runtime planning already caps disruption at the replicas that remain;
   - under `Coherent`, the resolved `maxUnavailable` must be `≥ rollingUpdate.minReplicas`, and the controllers also use `max(resolved, minReplicas)` at run time;
   - `rollingUpdate.minReplicas` is rejected under `RollingRecreate`, and all of `rollingUpdate` is rejected under `OnDelete`, as today.
-- **Immutable:** `init.minReplicas`, `rollingUpdate.minReplicas` and `availability.minReplicas`. Adding or removing `availability` is also rejected, because it switches gang termination on or off (§11 item 2).
-- **Immutability exception** (finding 8): a request that changes `updateStrategy.type` to `Coherent` may add `rollingUpdate.minReplicas`, and defaulting fills it in if it is omitted. A request that changes the strategy away from `Coherent` must remove it.
-- **Mutable:** `breachTolerance`, `maxUnavailable`, `progressDeadline` and `updateStrategy`.
+- **Mutable minimum fields** (§7.7, §11 item 18). Every change re-runs the ordering, autoscaling and `rollingUpdate` rules above against the new values.
+  - `init.minReplicas`, on clique templates and PCSG configs, is mutable. A change recreates the PCS replicas one at a time.
+  - `availability.minReplicas` is mutable and takes effect in place.
+  - `rollingUpdate.minReplicas` is mutable, except while a Coherent update is in progress (`IsCoherentUpdateInProgress` on the old object, whose status the request carries). A change applies from the next Coherent update. For the same window, a change of `updateStrategy.type` away from `Coherent` is rejected, because it removes the field.
+- **v1alpha1 requests keep today's immutability.** When the request's `RequestKind` is v1alpha1, which `matchPolicy: Equivalent` preserves, a change to any of the three values is rejected. So `minAvailable` stays immutable for v1alpha1 clients, and a lossy `kubectl replace` still fails (§5.3).
+- **Strategy switch** (finding 8), at both versions: a request that changes `updateStrategy.type` to `Coherent` may add `rollingUpdate.minReplicas`, and defaulting fills it in if it is omitted. A request that changes the strategy away from `Coherent` must remove it. Neither counts as a change of the value.
+- **Immutable:** adding or removing `availability`, because it switches gang termination on or off (§11 item 2).
+- **Mutable:** `breachTolerance`, `maxUnavailable`, `progressDeadline` and `updateStrategy`, apart from the Coherent-update window above.
 - **`startsAfter`:** today's rules in `pcs/validation/podcliqueset.go` apply to `startsAfter[].name`:
   - allowed only under `startupType: CliqueStartupTypeExplicit`;
   - names must be non-empty, unique (now also enforced by `listType=map`), and must not refer to the clique itself;
@@ -523,6 +529,47 @@ The awaiting states apply only when `availability` is set; otherwise the conditi
 - The `MinBreached` printer column on `pclq` and `pcsg` now shows `Unknown` during startup instead of `True`. The release notes say so (§8 commit 8), because scripts that wait on `True` during startup see a change.
 - **Lost status.** If an object's status is lost, for example when it is restored from a backup without status, it starts awaiting again. A PCLQ leaves the state again as soon as its pods are seen scheduled. A PCSG leaves only at its next availability, which is also how `WasPCSGEverHealthy` behaves today.
 
+### 7.7 Mutable minimum fields
+
+At v1beta1, the three minimum fields can change (§4.5). Each has its own effect. None of them enters `ComputePCLQPodTemplateHash` or `computeGenerationHash`, so finding 2 still holds.
+
+**`init.minReplicas` recreates the PCS replica.** The value fixes the gang shape, and nothing built from it can change in place:
+- PodGang `minAvailable` (`podgang/syncflow.go`);
+- the PodGangMap base-gang layout (`podgangmap/steadystate.go`);
+- the Kueue PodGroup counts, because Kueue Workload podSets are immutable;
+- the `--podcliques=<fqn>:<count>` args of dependents' init containers (`StartupDependencyTargetsInEntry`, finding 12).
+
+The mechanism:
+- **Detecting stale replicas.** The *gang-shape hash* covers every clique template's and every PCSG config's `init.minReplicas`, keyed by name. The PCS controller labels each replica's PCLQs and PCSGs with it (`grove.io/gang-shape-hash`). A replica is stale when any of its children carries a different value.
+- **Adopting unlabelled children.** A child without the label is adopted: the controller writes the current value and does not recreate the replica. So the upgrade, and objects created by N-1, recreate nothing.
+- **Pacing.** Replicas are recreated one at a time, lowest index first. The next starts once the recreated replica is available again.
+  - This applies under every strategy, including `OnDelete`, because the gang shape is not a pod-template change.
+  - It reuses gang termination's replica delete task (`createPCSReplicaDeleteTask` in `podcliquesetreplica/gangterminate.go`), with the event reason `GangShapeChanged`.
+  - The normal sync rebuilds the replica from the current template: its PCLQs, PCSGs, PodGangs and PodGangMap entries.
+- **Progress.** The recreate sets `status.updateProgress` the way a rolling update does. That suspends gang termination for the PCS while it runs, so a replica is never deleted twice. Under `Coherent`, it also freezes `rollingUpdate.minReplicas`.
+- **Interaction with updates.** A recreated replica comes up at the newest pod templates, so it counts as updated. The recreate takes precedence over an update in flight:
+  - the rolling update starts no new replica while any replica is stale;
+  - a replica the update had already started is recreated next.
+- **Disruptive by design.** Each recreate takes the whole replica down, base PodGang included. The field doc and the user guide say so.
+
+**`availability.minReplicas` changes in place.** Pods are not restarted, and no hash changes.
+- **Propagation.** It already reaches the children:
+  - `buildResource` and `setPodCliqueSpec` (`podcliqueset/components/podclique/podclique.go`) deep-copy the template spec into each PCLQ;
+  - the PCSG build writes the PCSG's `termination` on every sync (`podcliquescalinggroup.go`).
+- **Gap: Coherent updates.** During a Coherent update, replicas not under update keep their whole old spec (`preserveRevision`). Overlay the template's `termination.resource.availability` onto that preserved spec, so every replica gets the new floor at once. The PCSG member build in `podcliquescalinggroup/components/podclique/podclique.go` needs the same overlay.
+- **Breach semantics.** The PCLQ and PCSG status reconcilers evaluate `MinAvailableBreached` against the new floor on their next pass.
+  - Raising the floor above what is available sets the condition `True` at that moment, and gang termination follows `breachTolerance` later. This is allowed, and documented.
+  - Lowering it can clear a breach.
+  - The awaiting states (§7.6) are unaffected.
+  - `ReadyThreshold`, and with it `AvailableReplicas`, follows the new value.
+- **Scale guard.** It reads the value stored on the child, so until the child is synced it applies the old floor. Fix the comments in `scaleguard.go` that call the field immutable.
+- **Defaults don't follow.** A defaulted `rollingUpdate.minReplicas` keeps its value: defaulting only fills unset fields.
+
+**`rollingUpdate.minReplicas` applies from the next Coherent update.**
+- **No hashing.** The value is not hashed, so changing it never rolls pods.
+- **Where it is read.** The controllers read it from the live PCS template (finding 9). The admission freeze during a Coherent update (§4.5) therefore guarantees that an update runs with a single unit throughout.
+- **Same-request edits.** A request that changes a pod template and the unit together is accepted, and that update uses the new unit. The same holds for a unit change admitted after a template edit but before the controller records `updateProgress`, because no replica has been rolled yet.
+
 ## 8. PR sequence
 
 All Phase 1 work for release N lands as **one PR**. Release N is cut right after it merges. Numbers in brackets are the GREP's Phase 1 steps.
@@ -542,7 +589,7 @@ PR 1 is organized as eight commits, in this order. **Each commit builds and pass
 | **2** [2] | v1beta1 package as an identical copy of v1alpha1. Trivial generated conversion, registered as hub-and-spoke converters in the operator (§5.1). Multi-version CRDs (storage v1alpha1). `/convert`. The three converted CRDs get a fail-closed `Webhook` conversion at the default address, which the `crdInstaller` and the operator correct (§6.1, option B). `caBundle` injection and RBAC (§6.2). **Webhook rules switched to v1beta1 with `Equivalent`**, and `internal/webhook/...` handlers registered for v1beta1 types through the v1alpha1 bridge (§6.3). | None. The schemas are identical. |
 | **2b** | Serve the webhooks before the controllers are added, and move the PodGang migration gate from before `mgr.Start` to that point, with retries (§5.5). Without it, commit 3 would have the operator read PodCliqueSets through a `/convert` it does not serve yet. | None |
 | **3** [3] | Mechanical import switch (§7.2). The v1beta1 clients were already generated in commit 2. Removes the v1alpha1 bridge of the admission handlers (§6.3). | None |
-| **4** [4, 5, 6] | v1beta1 schema (§4.2–4.3), including dropping `packDomain` and the `[]StartupDependency` form of `startsAfter`. Hand-written conversion with the stash (§5.2–5.3), plus fuzz and table tests. v1alpha1 CEL rules. Deprecation markers. Accessors on v1beta1 fields. Defaulting and validation, including the immutability exception (§4.4–4.5). Scale guard. Per-component `breachTolerance`. Percentage `maxUnavailable` in update orchestration. `startsAfter` validation, and the per-dependency condition type passed to and enforced by `initc`. `MinAvailableBreached` awaiting states, with the PCSG upgrade carry-over (§7.6). Printer columns. v1beta1 status doc fixes (§11 item 17). | v1alpha1: none, except that `MinAvailableBreached` is `Unknown` during startup and a PCLQ's breach tolerance runs from its first schedule (§7.6). v1beta1-native: new semantics. |
+| **4** [4, 5, 6] | v1beta1 schema (§4.2–4.3), including dropping `packDomain` and the `[]StartupDependency` form of `startsAfter`. Hand-written conversion with the stash (§5.2–5.3), plus fuzz and table tests. v1alpha1 CEL rules. Deprecation markers. Accessors on v1beta1 fields. Defaulting and validation, including the mutability rules and the strategy-switch rule (§4.4–4.5). Mutable minimum fields: the gang-shape hash and replica recreate, the availability overlay on preserved specs (§7.7). Scale guard. Per-component `breachTolerance`. Percentage `maxUnavailable` in update orchestration. `startsAfter` validation, and the per-dependency condition type passed to and enforced by `initc`. `MinAvailableBreached` awaiting states, with the PCSG upgrade carry-over (§7.6). Printer columns. v1beta1 status doc fixes (§11 item 17). | v1alpha1: none, except that `MinAvailableBreached` is `Unknown` during startup and a PCLQ's breach tolerance runs from its first schedule (§7.6). v1beta1-native: new semantics. |
 | **5** [8] | Storage switch and migrator (§7.4), the sticky-storage handling in the `crdInstaller` (§3), and the downgrade procedure (§7.5). | Storage only |
 | **6** [10] | Envtest and e2e from §9: upgrade from N-1 under live traffic, downgrade to N-1, operator restarts, the equivalence suites with v1alpha1 and v1beta1 manifests, Story 1 and the #859 scenario. | — |
 | **7** [7] | Docs and samples:<br>- `docs/api-reference` (add v1beta1 to `hack/generate-api-docs.sh`);<br>- user guide and samples on v1beta1, keeping one v1alpha1 sample. This includes the startup-ordering samples (`simple2`/`simple3-explicit-startup-order.yaml`) and the e2e workloads that use `startsAfter`;<br>- a migration guide with the §5.2 table. | — |
@@ -579,13 +626,26 @@ What one PR changes compared with a PR series:
 - **Schemas:** PodGangMap and ClusterTopologyBinding schemas are identical across versions.
 - **Defaulting and validation:** every §4.4–4.5 rule, including:
   - rejection of adding or removing `availability`;
-  - the immutability exception when `updateStrategy.type` changes;
+  - the strategy-switch rule when `updateStrategy.type` changes;
+  - mutability (§4.5):
+    - each of the three fields is accepted at v1beta1;
+    - each is rejected when `RequestKind` is v1alpha1;
+    - a v1alpha1 strategy switch that drops `rollingUpdate.minReplicas` is still accepted;
+    - a `rollingUpdate.minReplicas` change, or a switch away from `Coherent`, is rejected while a Coherent update is in progress and accepted once it has ended;
+    - changes that break the ordering or autoscaling rules are rejected;
   - `startsAfter`: duplicate names, an invalid `conditionType` (including one containing `:`), changing any `conditionType` on update;
   - `startsAfter` condition types:
     - each built-in condition is accepted without a gate, and `DisruptionTarget` is rejected;
     - a custom condition is rejected when the parent doesn't declare it in `readinessGates` and accepted when it does, for standalone and PCSG-member parents;
     - an update that removes a referenced readiness gate from the parent's pod template is rejected, while removing an unreferenced gate is accepted;
   - a v1alpha1 update that moves `packDomain` to `pack.required` is accepted as an identity change.
+- **Mutable minimum fields** (§7.7):
+  - the gang-shape hash changes with any `init.minReplicas` and with nothing else;
+  - an unlabelled child is adopted, not recreated;
+  - a stale replica is deleted through the replica delete task, one replica at a time, under each strategy;
+  - the rolling update starts no replica while one is stale;
+  - a changed `availability` reaches PCLQs whose spec is preserved during a Coherent update, and PCSG members;
+  - neither pod-template hash nor generation hash changes with `availability.minReplicas` or `rollingUpdate.minReplicas`.
 - **Ready threshold:** `ReadyThreshold` is `availability.minReplicas` when set, and `init.minReplicas` when `availability` is nil.
 - **Awaiting states** (§7.6):
   - PCLQ: with `lastScheduled` nil, the condition is `Unknown`/`AwaitingInitialSchedule`, even during an update or at `replicas: 0`. Once scheduled, today's `True`/`False` results follow, and the first `True` has its `lastTransitionTime` at the schedule. An existing `True` keeps its `lastTransitionTime`.
@@ -636,6 +696,10 @@ What one PR changes compared with a PR series:
   - A Coherent update with `rollingUpdate.minReplicas` larger than `availability.minReplicas` rolls in the larger unit.
   - A percentage `maxUnavailable` is resolved correctly before and after scaling, and also after a scale-out or scale-in in the middle of an update, where the next reconcile uses the new budget (§11 item 8).
   - `rollingUpdate.minReplicas` is rejected under `RollingRecreate` and `OnDelete`, filled in when switching to `Coherent`, and must be removed when switching away.
+  - Raising `init.minReplicas` recreates the PCS replicas one at a time, with the next starting only once the previous is available. Afterwards the PodGangs and the init-container args carry the new count. This is tested under `RollingRecreate`, `Coherent` and `OnDelete`.
+  - Raising `availability.minReplicas` above the ready pods gang-terminates after `breachTolerance`. Lowering it clears the breach. No pod is restarted in either case.
+  - Changing `rollingUpdate.minReplicas` rolls no pods. The next pod-template change rolls in the new unit.
+  - The upgrade test also asserts that no replica is recreated for a missing gang-shape label.
   - The #859 pre-Ready scenario: the leader clique declares a readiness gate `example.com/placeholder-available` and cannot become `Ready` until the dependent clique runs. The dependent clique has `startsAfter: [{name: leader, conditionType: example.com/placeholder-available}]`. Once the test sets the condition on the required leader pods, the dependent leaves `Init` while the leaders are still not `Ready`, so there is no deadlock. Deleting a leader pod before the condition is set keeps the dependent blocked. This extends `startup_ordering_test.go`.
   - The existing `startup_ordering_test.go` passes unchanged with v1alpha1 manifests, as part of the equivalence runs.
 - **Certificates:** `caBundle` injection in `auto` and `manual` modes, and `manual`-mode rotation.
@@ -671,6 +735,10 @@ What one PR changes compared with a PR series:
 | **Clients rely on `MinAvailableBreached=True` during startup** (scripts, dashboards, `kubectl wait`) | Release notes (§8 commit 8). Grove's own consumers change in the same commit (§7.6). The awaiting reasons name the state explicitly. |
 | **An upgrade gang-terminates, or spares, a PCSG differently from N-1** | The carry-over reads N-1 conditions with today's `WasPCSGEverHealthy` (§7.6), covered by unit cases per condition shape and by the upgrade e2e. |
 | **A user upgrades from N-1 directly to N+1 or later** | Not supported (§3), and the release notes say so. The carry-over and the storage migration exist only in N. |
+| **An `init.minReplicas` edit takes replicas down** | Intended (§7.7). Replicas are recreated one at a time, each only after the previous one is available again. The field doc and the user guide say so. v1alpha1 clients cannot trigger it. |
+| **The upgrade recreates replicas** because existing children have no gang-shape label | An unlabelled child is adopted, not recreated (§7.7). Unit and upgrade e2e tests cover it. |
+| **Raising `availability.minReplicas` gang-terminates a running replica** | Intended and documented: the new floor applies at once, and termination waits `breachTolerance`. |
+| **A unit change mid-update splits a Coherent update** | Admission freezes `rollingUpdate.minReplicas` and the strategy while a Coherent update is in progress (§4.5). |
 | **Init-container args change for existing workloads on upgrade** | The `Ready` condition is never written into the args, so pods created by N for converted workloads match N-1. Running pods keep their original `initc` image and args. |
 
 ## 11. Open questions and GREP feedback
@@ -716,6 +784,14 @@ These were deferred. Release N is cut right after PR 1 (§8), so each needed a d
 9. **CRD delivery uses option B** (§6.1), replacing the earlier choice of option A. Helm cannot adopt CRDs that N-1 installed from `crds/` through a hook, since its ownership check runs first. The three CRDs stay in `crds/` with a fail-closed `Webhook` conversion at the default address. The `crdInstaller` and the operator correct the address, and cert-controller (`auto`) or the operator (`manual`) injects the `caBundle`. GREP step 2 needs the matching update. (Commit 2.)
 10. **PodGangMap and ClusterTopologyBinding use `conversion.strategy: None`** (§5.1). Their schemas are identical, so they never call the webhook, and their storage switches in N without it (§7.4). (Commit 2.)
 11. **The admission webhook paths are versioned in N** (§6.3, §10). The v1beta1 handlers are served on `/webhooks/v1beta1/...`, so an N-1 pod that receives a v1beta1 admission request during the rollout returns 404 and fails closed. Otherwise it would decode the object into v1alpha1 types, and from commit 4 the defaulting handler would patch away fields it doesn't know. This includes the authorizer, which now matches the v1beta1 kinds of PodClique, PodCliqueScalingGroup and PodGangMap. (Commit 2.)
+
+18. **The minimum fields are mutable at v1beta1** (§4.5, §7.7), replacing the GREP's immutability rule:
+    - `init.minReplicas` recreates PCS replicas one at a time, under every strategy;
+    - `availability.minReplicas` applies in place, including on replicas held back by a Coherent update;
+    - `rollingUpdate.minReplicas` is unhashed and applies from the next Coherent update. It, and a switch away from `Coherent`, are frozen while a Coherent update is in progress;
+    - v1alpha1 requests cannot change any of them.
+
+    The GREP's immutable-fields rule, its Test Plan and step 4 need the matching update. (Commit 4.)
 
 ### 11.3 `startsAfter` change (outside GREP-0877)
 
