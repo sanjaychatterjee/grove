@@ -43,7 +43,7 @@ Behavioural contract, the GREP's Phase 1 exit criteria: **every existing `v1alph
 1. **The legacy default is `1`.** `PodCliqueSpec.MinAvailable` and `PodCliqueScalingGroupConfig.MinAvailable` carry `+kubebuilder:default=1`, and the API server applies schema defaults before the defaulting webhook runs. The GREP's migration table now matches this.
 2. **The generation hashes are safe.** `computeGenerationHash` (`podcliqueset/reconcilespec.go`) and `ComputePCLQPodTemplateHash` (`utils/component/podclique.go`) hash only labels, annotations, pod spec and priority class. Moving the min-replica, update and termination fields therefore cannot trigger a rolling update. The upgrade test asserts this.
 3. **All admission webhooks use `matchPolicy: Exact` on `v1alpha1`.** That covers PCS defaulting and validation, PCLQ and PCSG validation (including `/scale`), ClusterTopologyBinding validation, and the authorizer rule for `podcliques`, `podcliquescalinggroups` and `podgangmaps`. If v1beta1 is served without changing them, v1beta1 writes bypass validation and the authorizer. GREP Phase 1 step 2 requires the switch to land in the same change; §6.3 implements it.
-4. **CRDs ship through Helm's `crds/` directory** (`operator/hack/prepare-charts.sh`), plus the opt-in `crdInstaller` (GREP-436). Files in `crds/` cannot be templated, but `spec.conversion.webhook.clientConfig.service.namespace` depends on the release namespace. A multi-version CRD without `spec.conversion` falls back to `strategy: None`, under which a v1alpha1 request's `minAvailable` is silently pruned. GREP step 2 now delivers it by moving the three converted CRDs to chart templates (option A, §6.1).
+4. **CRDs ship through Helm's `crds/` directory** (`operator/hack/prepare-charts.sh`), plus the opt-in `crdInstaller` (GREP-436). Files in `crds/` cannot be templated, but `spec.conversion.webhook.clientConfig.service.namespace` depends on the release namespace. A multi-version CRD without `spec.conversion` falls back to `strategy: None`, under which a v1alpha1 request's `minAvailable` is silently pruned. GREP step 2 therefore ships the three converted CRDs with a fail-closed `Webhook` strategy at a default address, which the operator corrects at run time (option B, §6.1).
 5. **Webhook certificates are managed by OPA cert-controller** (`internal/controller/cert/cert.go`) in `auto` mode, and by cert-manager in `manual` mode. cert-controller supports a `CRDConversion` webhook type for `caBundle` injection.
 6. **About 267 Go files import `operator/api/core/v1alpha1`**, which is why the import switch is its own mechanical commit (GREP step 3, §8 commit 3).
 7. **About 30 non-test call sites read `MinAvailable`, `TerminationDelay` or the int32 `MaxUnavailable`.** These include the Kueue scheduler backend ([#707](https://github.com/ai-dynamo/grove/pull/707)) and the Coherent sub-step planner. §7.3 maps each one to a purpose.
@@ -74,7 +74,7 @@ The deprecation window is the two releases that follow the storage migration in 
 
 The storage flag is **sticky**: nothing may move it back to v1alpha1 within N.
 - The `crdInstaller` keeps the live storage version when the live CRD already stores v1beta1.
-- The Helm templates for the three converted CRDs (§6.1, option A) render the live storage version via `lookup`.
+- Helm applies `crds/` only on first install and never on upgrade (§6.1), so `helm upgrade` cannot revert it.
 - A manual `kubectl apply` of N's manifests would revert it. The runnable watches the CRDs and switches again, and the migrator re-runs; this is self-healing. The upgrade guide says to use the chart or `install-crds`.
 
 From N+1 the marker is on v1beta1 in the source, and the switch runnable is a no-op. It is deleted in N+3.
@@ -94,7 +94,7 @@ Phase 2 can ship in N+1 or later. It needs every v1beta1 object created under Ph
 
 ### 4.1 Package layout
 
-- New package `operator/api/core/v1beta1`: `doc.go`, `register.go`, copies of all type files and helper methods (`TopologyConstraint.RequiredDomain` and so on), and `hub.go` with `Hub()` for all five kinds.
+- New package `operator/api/core/v1beta1`: `doc.go`, `register.go`, copies of all type files and helper methods (`TopologyConstraint.RequiredDomain` and so on). The api module stays free of controller-runtime, so the types implement neither `Hub()` nor `Convertible`.
 - `+kubebuilder:storageversion` stays on v1alpha1 in the release-N source. The N operator switches the live CRDs to v1beta1 at run time (§3). The marker moves to v1beta1 in N+1.
 - Move the CRD output from `api/core/v1alpha1/crds/` to `api/core/crds/`, with one multi-version CRD per kind. Update `embed.go`, `prepare-charts.sh`, `cmd/install-crds` and `internal/crdinstaller`.
 - `api/hack/generate.sh`:
@@ -257,7 +257,7 @@ Validation runs once, on the v1beta1 form (§6.3), so a v1alpha1 user's error me
 
 ### 5.1 Mechanics
 
-- Hub: v1beta1. Spoke: v1alpha1, implementing `conversion.Convertible`.
+- Hub: v1beta1. Spoke: v1alpha1. The operator registers each converted kind with controller-runtime's `NewHubSpokeConverter` and `NewSpokeConverter`, which call the generated and hand-written `Convert_*` functions, so the api module needs no `conversion.Convertible` methods. PodCliqueSet, PodClique and PodCliqueScalingGroup are registered.
 - Generate the field copying with **conversion-gen**: add `+k8s:conversion-gen=github.com/ai-dynamo/grove/operator/api/core/v1beta1` to `v1alpha1/doc.go`. conversion-gen refuses to compile until every non-trivial field has a hand-written `Convert_*` function, so a field added in Phase 2 cannot be dropped silently.
 - Hand-written functions live in `operator/api/core/v1alpha1/conversion.go`. They must be pure: no API calls, no defaulting, deterministic.
 - **PodGangMap and ClusterTopologyBinding** have identical schemas in both versions and use `conversion.strategy: None` (decided, §11 item 10), so they do not depend on the webhook. A unit test asserts that the schemas are structurally identical.
@@ -325,7 +325,7 @@ The GREP's Phase 2 migration treats **an unset `resource.restart` on a long-runn
 ### 5.5 Conversion webhook server
 
 - Register `/convert` on the existing webhook server with controller-runtime's conversion handler, built from a scheme with both versions. `internal/webhook/register.go` gains an always-on `conversion` registration.
-- `/convert` must be serving before the manager's caches start. In N, until the migration finishes, the operator's own v1beta1 list/watch of v1alpha1-stored objects goes through it. controller-runtime starts webhook runnables before caches; add a guard test and a readiness check on `/convert`.
+- `/convert` must be serving before anything reads a converted kind at v1beta1. From commit 3, until the migration finishes, the operator's own v1beta1 list/watch of v1alpha1-stored objects goes through it. So the webhooks, including `/convert`, are registered and served before the controllers are added. The pre-start steps that read converted kinds, today only the PodGang migration gate, move to that point and retry until the conversion webhook is reachable through the Service (§8, the commit before 3). `TestRegisterControllersAndWebhooks` pins the order.
 - `WaitTillWebhookCertsReady` must also wait for the CRD `caBundle` injection (§6.2) before controllers start.
 - `/convert` is served on every operator replica, not just the leader.
 - Metrics: `grove_conversion_requests_total`, `grove_conversion_duration_seconds` and `grove_conversion_failures_total`, per kind and direction.
@@ -334,27 +334,29 @@ The GREP's Phase 2 migration treats **an unset `resource.restart` on a long-runn
 
 ### 6.1 CRD `spec.conversion`
 
-The PodCliqueSet, PodClique and PodCliqueScalingGroup CRDs need `spec.conversion.webhook.clientConfig.service.{name, namespace, path}`. **Option A is chosen** (§11 item 9).
+The PodCliqueSet, PodClique and PodCliqueScalingGroup CRDs need `spec.conversion.webhook.clientConfig.service.{name, namespace, path, port}`. **Option B is chosen** (§11 item 9).
 
 | Option | Pros | Cons |
 |---|---|---|
-| **A (chosen).** Move these three CRDs from `crds/` to `templates/` with `helm.sh/resource-policy: keep`. Template `spec.conversion` from `Release.Namespace` and `service.name`. | Conversion config is always correct and applied atomically with the operator upgrade. Helm also upgrades these CRDs. | Diverges from GREP-436's `crds/` choice for three kinds. Existing installs need an adoption step: Helm ownership labels and annotations on the CRDs, set by the `crdInstaller` or a pre-upgrade hook. |
-| B. Keep `crds/`. The `crdInstaller` (namespace from the downward API) or the operator at startup patches `spec.conversion`. | Keeps the GREP-436 layout. | Until the patch lands, the CRD has two versions and `strategy: None`, so fields are silently pruned (finding 4). It also makes `crdInstaller` mandatory. |
+| A. Move these three CRDs from `crds/` to `templates/` with `helm.sh/resource-policy: keep`. Template `spec.conversion` from `Release.Namespace` and `service.name`. | Conversion config is rendered for the release namespace. Helm also upgrades these CRDs. | Helm cannot adopt the CRDs that N-1 installed from `crds/`. The ownership check runs before pre-upgrade hooks, in Helm 3 and 4, so an adoption hook never gets to run. Users would need `--take-ownership` (Helm ≥ 3.17) or a manual relabel step. It also diverges from GREP-436. |
+| **B (chosen).** Keep `crds/`. The CRDs ship with a fail-closed `Webhook` strategy at a default address. The `crdInstaller` and the operator correct the address at run time. | Keeps the GREP-436 layout and needs no adoption. A wrong or missing address fails requests instead of pruning fields. | Conversion fails until the operator has corrected the address and the `caBundle` is injected. A manual re-apply of the CRDs resets the address until the operator corrects it again. |
 
-With option A:
+With option B:
 
-- The three CRDs live in `charts/templates/` with `helm.sh/resource-policy: keep`, so `helm uninstall` never deletes them or the workloads. PodGangMap, ClusterTopologyBinding and the `scheduler.grove.io` CRDs stay in `crds/`.
-- `operator/hack/prepare-charts.sh` writes the three generated CRDs into templates. It adds the templated `spec.conversion`, the `cert-manager.io/inject-ca-from` annotation in `manual` mode (§6.2), and the `lookup`-based storage version (§3).
-- **Adoption of existing CRDs.** Helm refuses to take over a CRD that it did not create. Before the upgrade, a pre-upgrade hook adds `app.kubernetes.io/managed-by: Helm` and the `meta.helm.sh/release-name` and `meta.helm.sh/release-namespace` annotations to the three live CRDs. When the `crdInstaller` is enabled, it does the same. The hook needs `get` and `patch` on those CRDs, limited by `resourceNames`. A chart test and the upgrade e2e test cover the adoption (§9).
-- The `crdInstaller` still renders `spec.conversion` itself when enabled, so `install-crds` and Helm stay consistent.
-- GREP step 2 names option A. The GREP-436 owners must still agree to the three CRDs moving out of `crds/`.
+- **Generated default.** `api/hack/generate.sh` adds `spec.conversion` to the three CRDs after `controller-gen`: `strategy: Webhook`, service `grove-operator` in namespace `default` (the documented install), path `/convert`, port 9443, and `conversionReviewVersions: [v1]`. There is no `caBundle`. controller-gen has no marker for this. PodGangMap and ClusterTopologyBinding keep `strategy: None` (§5.1).
+- **`crdInstaller`.** It reads the operator namespace from the mounted service-account volume, and rewrites the service namespace of every CRD that has a Service-addressed conversion webhook before its server-side apply. The `caBundle` is not part of the applied configuration, so its injector keeps ownership of the field.
+- **Operator startup.** Before `mgr.Start`, the operator patches the three CRDs' conversion to its namespace and configured webhook port, with a merge patch that leaves `caBundle` unchanged. It exits with `ExitErrConfigureCRDConversion` if a CRD is missing or does not serve v1beta1. Without that check, the N operator would run against N-1's CRDs, and its v1beta1 admission rules would never match.
+- **Keeper.** A runnable on every replica re-applies the address every 30 seconds, so a `kubectl apply` of the CRD manifests heals. In `manual` mode, it also copies `ca.crt` from the server certificate directory into the `caBundle`, which picks up a rotated CA (§6.2).
+- **Upgrades.** Helm does not upgrade `crds/`. Without the `crdInstaller`, users apply N's CRDs before `helm upgrade`, as GREP-436 already requires. Applying them while N-1 runs is safe, because N-1 reads and writes the storage version v1alpha1 and never needs conversion (§3). The release notes and the upgrade guide state the order (§8 commit 8).
+- GREP step 2 describes option B.
 
 ### 6.2 Certificates
 
-- **`auto` mode:** add `cert.WebhookInfo{Type: cert.CRDConversion, Name: "<plural>.grove.io"}` for the three CRDs in `getWebhooks`. Grant `get`, `list`, `watch`, `update` and `patch` on `customresourcedefinitions` in `clusterrole.yaml`, restricted by `resourceNames`.
-  - The existing CRD rule in `clusterrole.yaml` is inside `{{- if .Values.crdInstaller.enabled }}` and has no `list` or `watch`. The conversion rule must be a separate, **unconditional** rule, because `caBundle` injection is needed whether or not the installer is enabled.
-  - Leave the legacy `clustertopologies.grove.io` name out of it; that CRD is never converted.
-- **`manual` mode:** add `cert-manager.io/inject-ca-from: <ns>/<cert>` to the templated CRDs, which option A makes possible.
+- **`auto` mode:** add `cert.WebhookInfo{Type: cert.CRDConversion, Name: "<plural>.grove.io"}` for the three CRDs in `getWebhooks`. cert-controller injects only the `caBundle`, and fails if `clientConfig` is missing, which the generated default (§6.1) rules out.
+- **`manual` mode:** the operator's keeper copies `ca.crt` from the mounted certificate Secret into the three CRDs (§6.1). The Secret already has to contain `ca.crt`. The `cert-manager.io/inject-ca-from` annotation is not used, because files in `crds/` cannot be templated per install.
+- **RBAC**, unconditional in `clusterrole.yaml`, because the address correction and `caBundle` injection are needed whether or not the installer is enabled:
+  - `get`, `list` and `watch` on all `customresourcedefinitions`. cert-controller watches CRDs through an informer, which cannot be restricted by `resourceNames`.
+  - `update` and `patch` on the three converted CRDs, restricted by `resourceNames`. The legacy `clustertopologies.grove.io` name stays out of it; that CRD is never converted.
 - Extend `e2e/tests/cert_management_test.go` to cover CRD `caBundle` injection and rotation in both modes.
 
 ### 6.3 Admission webhook configurations
@@ -368,7 +370,9 @@ Change every `grove.io` rule in `charts/templates/*-webhook-config.yaml` to `api
 
 The API server then converts v1alpha1 requests before calling the webhooks, so defaulting and validation have a single v1beta1 implementation. This lands in commit 2 of §8, the first commit that serves v1beta1.
 
-Because every request now arrives as v1beta1, every handler under `internal/webhook/admission` must decode into v1beta1 types in the same commit. That covers PCS defaulting and validation, PCSG validation, ClusterTopologyBinding validation, the authorizer, and the PCLQ handler's `decodeReplicas` for Kueue scale validation (#707). Decoding v1beta1 into the v1alpha1 Go types fails or silently mis-decodes. Commit 2 therefore moves `internal/webhook/...` to v1beta1 ahead of the general import switch in commit 3. This is cheap, because the schemas are still identical at commit 2. Add a test in `charts/deployment_test.go` that fails if any `grove.io` rule uses `Exact` or omits v1beta1.
+Because every request now arrives as v1beta1, every handler under `internal/webhook/admission` must decode into v1beta1 types in the same commit. That covers PCS defaulting and validation, PCSG validation, ClusterTopologyBinding validation, the authorizer, and the PCLQ handler's `decodeReplicas` for Kueue scale validation (#707). Decoding v1beta1 into the v1alpha1 Go types fails or silently mis-decodes. In commit 2, the handlers are registered for v1beta1 types. Their logic and its callees, such as the scheduler backends, still take v1alpha1 until commit 3, so `internal/webhook/admission/v1alpha1bridge` converts the decoded v1beta1 object to v1alpha1 with the generated functions. The defaulting handler converts its result back. Commit 3 removes the bridge. The authorizer's decoder matches the v1beta1 kinds, since requests arrive with them.
+
+All six admission webhooks move to `/webhooks/v1beta1/...` paths. During the N-1 → N rolling update, the Service still routes some requests to N-1 pods after Helm has switched the rules. On the new paths an N-1 pod answers 404 and the request fails closed. On the old paths it would decode a v1beta1 object as v1alpha1 (§10). A test in `charts/webhook_test.go` fails if any webhook uses `Exact`, a `grove.io` rule does not match exactly v1beta1, or a path is not versioned.
 
 ## 7. Operator changes
 
@@ -535,13 +539,14 @@ PR 1 is organized as eight commits, in this order. **Each commit builds and pass
 | Commit | Content | Behaviour change at that commit |
 |---|---|---|
 | **1** [1] | Accessor layer (§7.1) on v1alpha1, with unit tests that pin today's values. It includes `StartupDependencies`, plus `initc` support for the optional `:<conditionType>` argument (it parses but never emits it yet). | None |
-| **2** [2] | v1beta1 package as an identical copy of v1alpha1, plus `Hub()`. Trivial generated conversion. Multi-version CRDs (storage v1alpha1). `/convert`. The three converted CRDs move to chart templates with the templated `spec.conversion` and the Helm adoption hook (§6.1, option A). `caBundle` injection and RBAC (§6.2). **Webhook rules switched to v1beta1 with `Equivalent`**, and `internal/webhook/...` handlers moved to v1beta1 types (§6.3). | None. The schemas are identical. |
-| **3** [3] | Mechanical import switch (§7.2) and regenerated clients. | None |
+| **2** [2] | v1beta1 package as an identical copy of v1alpha1. Trivial generated conversion, registered as hub-and-spoke converters in the operator (§5.1). Multi-version CRDs (storage v1alpha1). `/convert`. The three converted CRDs get a fail-closed `Webhook` conversion at the default address, which the `crdInstaller` and the operator correct (§6.1, option B). `caBundle` injection and RBAC (§6.2). **Webhook rules switched to v1beta1 with `Equivalent`**, and `internal/webhook/...` handlers registered for v1beta1 types through the v1alpha1 bridge (§6.3). | None. The schemas are identical. |
+| **2b** | Serve the webhooks before the controllers are added, and move the PodGang migration gate from before `mgr.Start` to that point, with retries (§5.5). Without it, commit 3 would have the operator read PodCliqueSets through a `/convert` it does not serve yet. | None |
+| **3** [3] | Mechanical import switch (§7.2). The v1beta1 clients were already generated in commit 2. Removes the v1alpha1 bridge of the admission handlers (§6.3). | None |
 | **4** [4, 5, 6] | v1beta1 schema (§4.2–4.3), including dropping `packDomain` and the `[]StartupDependency` form of `startsAfter`. Hand-written conversion with the stash (§5.2–5.3), plus fuzz and table tests. v1alpha1 CEL rules. Deprecation markers. Accessors on v1beta1 fields. Defaulting and validation, including the immutability exception (§4.4–4.5). Scale guard. Per-component `breachTolerance`. Percentage `maxUnavailable` in update orchestration. `startsAfter` validation, and the per-dependency condition type passed to and enforced by `initc`. `MinAvailableBreached` awaiting states, with the PCSG upgrade carry-over (§7.6). Printer columns. v1beta1 status doc fixes (§11 item 17). | v1alpha1: none, except that `MinAvailableBreached` is `Unknown` during startup and a PCLQ's breach tolerance runs from its first schedule (§7.6). v1beta1-native: new semantics. |
-| **5** [8] | Storage switch and migrator (§7.4), the sticky-storage handling in the `crdInstaller` and the chart's `lookup` (§3), and the downgrade procedure (§7.5). | Storage only |
+| **5** [8] | Storage switch and migrator (§7.4), the sticky-storage handling in the `crdInstaller` (§3), and the downgrade procedure (§7.5). | Storage only |
 | **6** [10] | Envtest and e2e from §9: upgrade from N-1 under live traffic, downgrade to N-1, operator restarts, the equivalence suites with v1alpha1 and v1beta1 manifests, Story 1 and the #859 scenario. | — |
 | **7** [7] | Docs and samples:<br>- `docs/api-reference` (add v1beta1 to `hack/generate-api-docs.sh`);<br>- user guide and samples on v1beta1, keeping one v1alpha1 sample. This includes the startup-ordering samples (`simple2`/`simple3-explicit-startup-order.yaml`) and the e2e workloads that use `startsAfter`;<br>- a migration guide with the §5.2 table. | — |
-| **8** | Release notes covering the downgrade procedure (§7.5), the v1alpha1 removal in N+3, upgrades into N+1 and later only from N (§3), `MinAvailableBreached=Unknown` during startup and the breach-timing change (§7.6), and Go consumers such as Dynamo. | — |
+| **8** | Release notes covering the CRD-before-chart upgrade order (§6.1), the downgrade procedure (§7.5), the v1alpha1 removal in N+3, upgrades into N+1 and later only from N (§3), `MinAvailableBreached=Unknown` during startup and the breach-timing change (§7.6), and Go consumers such as Dynamo. | — |
 
 The schema change, the conversion and the call-site migration are a single commit (4). Removing `minAvailable` breaks every call site that commit 1 has not already routed through an accessor, so they cannot build separately. Commit 1 is what keeps commit 4 reviewable. The mechanical import switch stays isolated in commit 3, so reviewers can check it as a pure rename.
 
@@ -593,9 +598,12 @@ What one PR changes compared with a PR series:
 - **Phase 2 safety:** neither conversion nor the stash ever produces a `restart` field (§5.4).
 - **Chart:**
   - no `grove.io` webhook rule uses `Exact`, and every rule includes v1beta1;
-  - the PodCliqueSet, PodClique and PodCliqueScalingGroup CRDs render from templates. Each has `helm.sh/resource-policy: keep`, a `spec.conversion` that points at the release namespace, and the `inject-ca-from` annotation in `manual` mode;
-  - with a stubbed `lookup` that returns a live CRD stored at v1beta1, the rendered storage version is v1beta1;
-  - PodGangMap and ClusterTopologyBinding stay in `crds/` with `strategy: None`.
+  - the operator's ClusterRole allows `update` and `patch` on the three converted CRDs with and without the `crdInstaller`.
+- **CRD conversion:**
+  - the generated PodCliqueSet, PodClique and PodCliqueScalingGroup CRDs have the default `Webhook` conversion, and PodGangMap and ClusterTopologyBinding have none;
+  - the `crdInstaller` rewrites the service namespace and applies no `caBundle`;
+  - the operator's startup correction sets the namespace and port, keeps an injected `caBundle`, and fails on a missing CRD or one without v1beta1;
+  - the keeper restores a reset address, and in `manual` mode injects and rotates `ca.crt`.
 - **PodGangs:** PodGang annotations never contain `grove.io/v1beta1-conversion-data`.
 
 **Envtest**, with CRD conversion patched to the local webhook server via `WebhookInstallOptions`:
@@ -615,9 +623,9 @@ What one PR changes compared with a PR series:
     - a PCLQ breach still gang-terminates after the original delay;
     - a PCSG that was never healthy at the upgrade is not gang-terminated, and a PCSG that was healthy and then breached is gang-terminated after the delay (§7.6);
     - the storage switch happens only after `/convert` is ready, the migrator completes, and `storedVersions == ["v1beta1"]`;
-    - Helm adopts the three CRDs that N-1 installed from `crds/`, and later `helm upgrade` runs keep managing them (§6.1).
+    - after N's CRDs are applied over N-1's, with and without the `crdInstaller`, conversion points at the release namespace and N-1 keeps working until it is replaced (§6.1).
 - **Upgrade under load:** during the N-1 → N upgrade, a client keeps writing v1alpha1 PodCliqueSets while the N-1 operator keeps reconciling. No write fails apart from ordinary conflicts. That holds because storage stays v1alpha1 until N serves `/convert` (§3).
-- **Sticky storage:** re-running the `crdInstaller` init container and running `helm upgrade` with changed values both leave storage on v1beta1. A manual `kubectl apply` of N's CRDs is switched back by the runnable, and the migrator re-runs.
+- **Sticky storage:** re-running the `crdInstaller` init container and running `helm upgrade` with changed values both leave storage on v1beta1. A manual `kubectl apply` of N's CRDs is switched back by the runnable, and the migrator re-runs. The keeper restores the conversion address the apply reset.
 - **Downgrade:** `install-crds downgrade-storage` then N → N-1 keeps workloads running and readable at v1alpha1. Upgrading back to N restores v1beta1-only values from the annotation.
 - **Rollbacks:** N+1 → N keeps workloads running and readable.
 - **Equivalence:** `gang_termination_test.go`, `scaleguard_test.go`, `gang_scheduling_test.go` and the `update/` suite pass with v1alpha1 manifests and again with equivalent v1beta1 manifests.
@@ -630,7 +638,7 @@ What one PR changes compared with a PR series:
   - `rollingUpdate.minReplicas` is rejected under `RollingRecreate` and `OnDelete`, filled in when switching to `Coherent`, and must be removed when switching away.
   - The #859 pre-Ready scenario: the leader clique declares a readiness gate `example.com/placeholder-available` and cannot become `Ready` until the dependent clique runs. The dependent clique has `startsAfter: [{name: leader, conditionType: example.com/placeholder-available}]`. Once the test sets the condition on the required leader pods, the dependent leaves `Init` while the leaders are still not `Ready`, so there is no deadlock. Deleting a leader pod before the condition is set keeps the dependent blocked. This extends `startup_ordering_test.go`.
   - The existing `startup_ordering_test.go` passes unchanged with v1alpha1 manifests, as part of the equivalence runs.
-- **Certificates:** `caBundle` injection in `auto` and `manual` modes.
+- **Certificates:** `caBundle` injection in `auto` and `manual` modes, and `manual`-mode rotation.
 - **Operator restarts** in N, both between the storage switch and the end of migration and during migration, recover. `/convert` comes up before the caches, and the migrator resumes.
 - **Kubernetes versions:** the compatibility matrix ([#820](https://github.com/ai-dynamo/grove/pull/820)) runs the standard suites on 1.34 and 1.35, but upgrade tests run only on their dedicated target. Add the conversion envtest and the v1alpha1/v1beta1 equivalence runs to the matrix. Run the N-1 → N upgrade test on both versions at least for release N, because conversion-webhook and `matchPolicy: Equivalent` behaviour is API-server-side.
 - **Kueue backend:**
@@ -642,15 +650,17 @@ What one PR changes compared with a PR series:
 | Risk | Mitigation |
 |---|---|
 | **The operator is down, so conversion is down.** v1alpha1 reads and writes fail. In N, between the storage switch and the end of migration, reads of unmigrated objects also fail at v1beta1. | Run 2 or more operator replicas with a PodDisruptionBudget; webhooks run on all replicas. Add `/convert` readiness. The migrator shortens the window. |
-| **Silent field pruning under `strategy: None`** (finding 4) | Option A (§6.1) templates `spec.conversion`, and the `crdInstaller` always writes it. A test fails if a multi-version CRD lacks it. |
+| **Silent field pruning under `strategy: None`** (finding 4) | The generated CRDs carry a fail-closed `Webhook` strategy (§6.1), so a wrong address fails requests instead of pruning. A test fails if a converted CRD lacks it. |
+| **Conversion fails until the address and `caBundle` are set** (option B, §6.1): on a fresh install, or after a manual re-apply of the CRDs | Before N's operator runs, nothing needs conversion: storage is v1alpha1 and clients use v1alpha1 (§3). The operator corrects the address before its manager starts, and the keeper heals a re-apply within 30 seconds. |
+| **The N operator starts against N-1's CRDs** because the user ran `helm upgrade` without applying N's CRDs | The operator exits at startup when a CRD does not serve v1beta1 (§6.1). The release notes give the order. |
+| **Requests reach N-1 pods during the rolling update.** The Service selects N-1 and N pods while the Deployment rolls. N-1 pods do not serve `/convert`. They also receive v1beta1 admission requests once Helm has switched the rules (§6.3). From commit 4, the N-1 defaulting handler would decode a v1beta1 object into v1alpha1 types and patch away the fields it doesn't know. | `/convert` on an N-1 pod returns 404, so conversion fails closed and clients retry. The v1beta1 admission handlers are served on `/webhooks/v1beta1/` paths (§6.3), so an N-1 pod also returns 404 instead of mis-decoding. Both fail closed, and the window lasts as long as the rollout. |
 | **Validation and authorizer bypass at v1beta1** (finding 3) | Commit 2 switches every rule to v1beta1 with `Equivalent`, backed by the chart test. |
 | **Lossy v1beta1 → v1alpha1 for older clients** such as Dynamo | Round-trip annotation (§5.3), fuzz tests, and release notes asking consumers to move to v1beta1. |
 | **A v1alpha1 client switches `updateStrategy` while a stash holds `rollingUpdate.minReplicas`** | The strategy-aware overlay rule (§5.3) and a fuzz case for it. |
 | **Percentage `maxUnavailable` changes with scaling mid-update** | This is intended, and matches Deployments. Every reconcile resolves the value again against the live component's `spec.replicas`, so a scale-out raises the budget and a scale-in lowers it. Under `Coherent`, `max(resolved, minReplicas)` keeps the budget at least the minimum update unit, and runtime planning caps disruption at the replicas that remain (#884). A unit test and the e2e scaling case in §9 cover it. |
-| **Helm cannot adopt the three CRDs on upgrade** (option A, §6.1) | The pre-upgrade hook and the `crdInstaller` add Helm ownership metadata first. The upgrade e2e starts from an N-1 install whose CRDs came from `crds/`. |
 | **A plain rollback from N to N-1 fails after the storage switch** | The downgrade procedure (§7.5), tested in e2e and documented in the release notes. N+1 → N and later rollbacks are plain. |
 | **Writes fail during the N-1 → N upgrade** because storage moved before anything served `/convert` | Staged switch (§3). N's CRDs keep v1alpha1 storage, and the N operator switches only once `/convert` and `caBundle` are ready. An e2e test runs the upgrade under write load. |
-| **Something reverts the storage flag within N** (manual `kubectl apply`, Helm re-render) | The flag is sticky in the `crdInstaller` and the chart (`lookup`). The runnable re-applies the switch, and the migrator re-runs. |
+| **Something reverts the storage flag within N** (manual `kubectl apply`) | The flag is sticky in the `crdInstaller`, and Helm never upgrades `crds/`. The runnable re-applies the switch, and the migrator re-runs. |
 | **v1alpha1 consumers still writing `packDomain` see `pack.required` on read** | The stash marker restores the `packDomain` form for v1alpha1 readers. Release notes point consumers to `pack.required`. |
 | **Consumers miss the v1alpha1 removal in N+3** | The `deprecationWarning` names the removal release from N onward, and the release notes of N+1 and N+2 repeat it. |
 | **Phase 1 accidentally breaks Phase 2's "unset restart means it predates Phase 2" rule** | §5.4, enforced by conversion-gen and a unit test. |
@@ -690,7 +700,7 @@ Added in `1560cbc`:
 
 - **Upgrades into N+1 and later must pass through N** (§3; GREP step 9).
 - **`maxUnavailable` is resolved on every reconcile, not frozen** (item 8; GREP "Interaction with existing features" and Test Plan).
-- **CRD delivery is option A, and PodGangMap and ClusterTopologyBinding use `conversion.strategy: None`** (items 9 and 10, §6.1, §5.1; GREP step 2).
+- **PodGangMap and ClusterTopologyBinding use `conversion.strategy: None`** (item 10, §5.1; GREP step 2). GREP step 2 also named option A for CRD delivery; it needs updating for option B (item 9).
 - **`rollingUpdate.maxUnavailable` and `rollingUpdate.progressDeadline` stay mutable** (§4.5; GREP mutable-fields list).
 
 Two fixes against `main`, both added in `eda4763`:
@@ -703,8 +713,9 @@ Two fixes against `main`, both added in `eda4763`:
 These were deferred. Release N is cut right after PR 1 (§8), so each needed a decision before the commit that uses it.
 
 8. **`maxUnavailable` is not frozen.** Every reconcile resolves it again against the live component's `spec.replicas`, under `Coherent` as `max(resolved, minReplicas)`. So no new status field is needed, and the v1beta1 schema gains nothing for it. GREP revision `1560cbc` removed its "freezes the resolved value in its plan" wording (§11.1). §7.3 and §10 follow this. (Commit 4.)
-9. **CRD delivery uses option A** (§6.1). The PodCliqueSet, PodClique and PodCliqueScalingGroup CRDs move to chart templates, with `helm.sh/resource-policy: keep`, a templated `spec.conversion`, a pre-upgrade adoption hook, and a `lookup` that keeps storage sticky (§3). The GREP-436 owners still need to agree to the layout change. (Commit 2; the sticky-storage part in commit 5.)
+9. **CRD delivery uses option B** (§6.1), replacing the earlier choice of option A. Helm cannot adopt CRDs that N-1 installed from `crds/` through a hook, since its ownership check runs first. The three CRDs stay in `crds/` with a fail-closed `Webhook` conversion at the default address. The `crdInstaller` and the operator correct the address, and cert-controller (`auto`) or the operator (`manual`) injects the `caBundle`. GREP step 2 needs the matching update. (Commit 2.)
 10. **PodGangMap and ClusterTopologyBinding use `conversion.strategy: None`** (§5.1). Their schemas are identical, so they never call the webhook, and their storage switches in N without it (§7.4). (Commit 2.)
+11. **The admission webhook paths are versioned in N** (§6.3, §10). The v1beta1 handlers are served on `/webhooks/v1beta1/...`, so an N-1 pod that receives a v1beta1 admission request during the rollout returns 404 and fails closed. Otherwise it would decode the object into v1alpha1 types, and from commit 4 the defaulting handler would patch away fields it doesn't know. This includes the authorizer, which now matches the v1beta1 kinds of PodClique, PodCliqueScalingGroup and PodGangMap. (Commit 2.)
 
 ### 11.3 `startsAfter` change (outside GREP-0877)
 
