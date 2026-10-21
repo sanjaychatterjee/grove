@@ -235,7 +235,7 @@ The CA (completion-aware) column of the GREP table (`init.minReplicas: spec.repl
   - `maxUnavailable` must be an integer `≥ 1` or a percentage in `[1%, 100%]`. There is no upper bound against `replicas`. [#884](https://github.com/ai-dynamo/grove/pull/884) removed it because the live PCLQ or PCSG is scaled independently of the template through `/scale`, and runtime planning already caps disruption at the replicas that remain;
   - under `Coherent`, the resolved `maxUnavailable` must be `≥ rollingUpdate.minReplicas`, and the controllers also use `max(resolved, minReplicas)` at run time;
   - `rollingUpdate.minReplicas` is rejected under `RollingRecreate`, and all of `rollingUpdate` is rejected under `OnDelete`, as today.
-- **Mutable minimum fields** (§7.7, §11 item 18). Every change re-runs the ordering, autoscaling and `rollingUpdate` rules above against the new values. So lowering `init.minReplicas` below `rollingUpdate.minReplicas` must lower the unit in the same edit, and raising `availability.minReplicas` above a stored `autoScalingConfig.minReplicas` must raise that too, because a defaulted value does not follow.
+- **Mutable minimum fields** (§7.7, §11 item 18). Every change re-runs the ordering, autoscaling and `rollingUpdate` rules above against the new values. So lowering `init.minReplicas` below `rollingUpdate.minReplicas` must lower the unit in the same edit, and, when `autoScalingConfig` is set, raising `availability.minReplicas` above its stored `minReplicas` must raise that too, because a defaulted value does not follow. When `autoScalingConfig` is nil, `availability.minReplicas` can change on its own.
   - `init.minReplicas`, on clique templates and PCSG configs, is mutable. A change recreates the PCS replicas one at a time.
   - `availability.minReplicas` is mutable and takes effect in place.
   - `rollingUpdate.minReplicas` is mutable, except while a Coherent update is in progress (`IsCoherentUpdateInProgress` on the old object, whose status the request carries). A change applies from the next Coherent update. For the same window, a change of `updateStrategy.type` away from `Coherent` is rejected, because it removes the field.
@@ -633,7 +633,7 @@ What one PR changes compared with a PR series:
     - each is rejected when `RequestKind` is v1alpha1;
     - a v1alpha1 strategy switch that drops `rollingUpdate.minReplicas` is still accepted;
     - a `rollingUpdate.minReplicas` change, or a switch away from `Coherent`, is rejected while a Coherent update is in progress and accepted once it has ended;
-    - changes that break the ordering or autoscaling rules are rejected, including lowering `init.minReplicas` below the unit and raising `availability.minReplicas` above `autoScalingConfig.minReplicas`;
+    - changes that break the ordering or autoscaling rules are rejected, including lowering `init.minReplicas` below the unit and raising `availability.minReplicas` above a set `autoScalingConfig.minReplicas`, while the same raise is accepted when `autoScalingConfig` is nil;
   - `rollingUpdate.minReplicas` above `init.minReplicas` or above `replicas` is rejected;
   - `autoScalingConfig.minReplicas`:
     - with `availability` set, it defaults to `availability.minReplicas`, and a lower value is rejected;
