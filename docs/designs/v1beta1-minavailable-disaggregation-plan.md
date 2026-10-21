@@ -221,20 +221,21 @@ Printer columns: on `pclq` and `pcsg`, replace `MinAvail` with `InitMin` (`.spec
 | `rollingUpdate.minReplicas` (standalone PCLQ, PCSG) | under `Coherent`: `availability.minReplicas` if set, else `1`; not set under other strategies |
 | `rollingUpdate.maxUnavailable` | under `Coherent`: `rollingUpdate.minReplicas`; under `RollingRecreate`: `1` (as today); always written as an integer |
 | `updateStrategy.type` | `RollingRecreate` (unchanged) |
+| `autoScalingConfig.minReplicas` (standalone PCLQ, PCSG; when `autoScalingConfig` is set) | `availability.minReplicas` if set, else `1`. For requests whose `RequestKind` is v1alpha1: `replicas`, as today (`pcs/defaulting/podcliqueset.go`), so v1alpha1 behaviour is unchanged. |
 | `startsAfter[].conditionType` | `Ready`, as a schema default. It is always set after admission and conversion. |
 
 The CA (completion-aware) column of the GREP table (`init.minReplicas: spec.replicas`) arrives with `completion` in Phase 2.
 
 ### 4.5 Validation (v1beta1 validating webhooks)
 
-- **Ordering:** `1 ≤ availability.minReplicas ≤ init.minReplicas ≤ replicas`, and `1 ≤ rollingUpdate.minReplicas ≤ replicas`.
-- **Autoscaling:** `scaleConfig.minReplicas ≥ availability.minReplicas`. This replaces the current `≥ minAvailable`.
+- **Ordering:** `1 ≤ availability.minReplicas ≤ init.minReplicas ≤ replicas`, and `1 ≤ rollingUpdate.minReplicas ≤ min(init.minReplicas, replicas)`. `replicas` is the template's, and the rules hold on every write, as today's `minAvailable ≤ replicas` does. A live PCLQ or PCSG can still be scaled below `init.minReplicas` through `/scale`, down to the scale guard's floor.
+- **Autoscaling:** `autoScalingConfig.minReplicas ≥ availability.minReplicas`, or `≥ 1` when `availability` is nil. This replaces the current `≥ minAvailable`. The default follows the same floor (§4.4).
 - **`rollingUpdate` rules:** today's rules stay, with `minReplicas` in place of `minAvailable` (`validateRollingUpdateConfiguration` in `pcs/validation/podcliqueset.go`):
   - `rollingUpdate` is rejected on a PCSG-member clique template;
   - `maxUnavailable` must be an integer `≥ 1` or a percentage in `[1%, 100%]`. There is no upper bound against `replicas`. [#884](https://github.com/ai-dynamo/grove/pull/884) removed it because the live PCLQ or PCSG is scaled independently of the template through `/scale`, and runtime planning already caps disruption at the replicas that remain;
   - under `Coherent`, the resolved `maxUnavailable` must be `≥ rollingUpdate.minReplicas`, and the controllers also use `max(resolved, minReplicas)` at run time;
   - `rollingUpdate.minReplicas` is rejected under `RollingRecreate`, and all of `rollingUpdate` is rejected under `OnDelete`, as today.
-- **Mutable minimum fields** (§7.7, §11 item 18). Every change re-runs the ordering, autoscaling and `rollingUpdate` rules above against the new values.
+- **Mutable minimum fields** (§7.7, §11 item 18). Every change re-runs the ordering, autoscaling and `rollingUpdate` rules above against the new values. So lowering `init.minReplicas` below `rollingUpdate.minReplicas` must lower the unit in the same edit, and raising `availability.minReplicas` above a stored `autoScalingConfig.minReplicas` must raise that too, because a defaulted value does not follow.
   - `init.minReplicas`, on clique templates and PCSG configs, is mutable. A change recreates the PCS replicas one at a time.
   - `availability.minReplicas` is mutable and takes effect in place.
   - `rollingUpdate.minReplicas` is mutable, except while a Coherent update is in progress (`IsCoherentUpdateInProgress` on the old object, whose status the request carries). A change applies from the next Coherent update. For the same window, a change of `updateStrategy.type` away from `Coherent` is rejected, because it removes the field.
@@ -255,7 +256,7 @@ The CA (completion-aware) column of the GREP table (`init.minReplicas: spec.repl
   - **Any other (custom) condition is rejected unless the parent clique template's pod spec declares it in `spec.readinessGates`.** The parent may be a standalone clique or a PCSG member; its template is in the same PodCliqueSet. The error names the dependency, the condition and the parent clique. This catches typos at admission. Because `startsAfter` is immutable, a typo would otherwise mean deleting and recreating the PodCliqueSet (§11 item 12).
 - **Readiness gates referenced by `startsAfter` cannot be removed.** The parent's pod template stays mutable, so on update the webhook re-runs the rule above against the new template. It rejects a template change that drops a readiness gate still named by a dependent's `startsAfter`. Otherwise an update could recreate the parent pods without the gate, and the dependents would wait forever.
 - **`startsAfter` is immutable,** including each `conditionType`, as today (`ValidateImmutableField` in the PCS update path).
-- **Scale guard** (`scaleguard.go`): `spec.replicas` must be `0` or `≥ availability.minReplicas`, falling back to `init.minReplicas` when `availability` is nil. The anchor `PodGroup.minReplicas` is clamped to `min(init.minReplicas, replicas)`.
+- **Scale guard** (`scaleguard.go`): `spec.replicas` must be `0` or `≥ availability.minReplicas`. When `availability` is nil, the floor is `1`, the same as for `autoScalingConfig.minReplicas`, so only the scale-to-zero exception applies. Converted objects always have `availability`, so v1alpha1 workloads keep today's floor of `minAvailable`. The anchor `PodGroup.minReplicas` is clamped to `min(init.minReplicas, replicas)`.
 
 Validation runs once, on the v1beta1 form (§6.3), so a v1alpha1 user's error messages name v1beta1 paths. Add CEL `XValidation` rules on the v1alpha1 schema for `minAvailable ≤ 0` and `minAvailable > replicas`, so those errors use v1alpha1 field names.
 
@@ -567,7 +568,7 @@ The mechanism:
 
 **`rollingUpdate.minReplicas` applies from the next Coherent update.**
 - **No hashing.** The value is not hashed, so changing it never rolls pods.
-- **Where it is read.** The controllers read it from the live PCS template (finding 9). The admission freeze during a Coherent update (§4.5) therefore guarantees that an update runs with a single unit throughout.
+- **Where it is read.** The controllers read it from the live PCS template (finding 9). The admission freeze during a Coherent update (§4.5) therefore guarantees that an update runs with a single unit throughout. Because the unit must stay `≤ min(init.minReplicas, replicas)`, the freeze also stops `init.minReplicas` and the template's `replicas` from going below it until the update ends.
 - **Same-request edits.** A request that changes a pod template and the unit together is accepted, and that update uses the new unit. The same holds for a unit change admitted after a template edit but before the controller records `updateProgress`, because no replica has been rolled yet.
 
 ## 8. PR sequence
@@ -589,7 +590,7 @@ PR 1 is organized as eight commits, in this order. **Each commit builds and pass
 | **2** [2] | v1beta1 package as an identical copy of v1alpha1. Trivial generated conversion, registered as hub-and-spoke converters in the operator (§5.1). Multi-version CRDs (storage v1alpha1). `/convert`. The three converted CRDs get a fail-closed `Webhook` conversion at the default address, which the `crdInstaller` and the operator correct (§6.1, option B). `caBundle` injection and RBAC (§6.2). **Webhook rules switched to v1beta1 with `Equivalent`**, and `internal/webhook/...` handlers registered for v1beta1 types through the v1alpha1 bridge (§6.3). | None. The schemas are identical. |
 | **2b** | Serve the webhooks before the controllers are added, and move the PodGang migration gate from before `mgr.Start` to that point, with retries (§5.5). Without it, commit 3 would have the operator read PodCliqueSets through a `/convert` it does not serve yet. | None |
 | **3** [3] | Mechanical import switch (§7.2). The v1beta1 clients were already generated in commit 2. Removes the v1alpha1 bridge of the admission handlers (§6.3). | None |
-| **4** [4, 5, 6] | v1beta1 schema (§4.2–4.3), including dropping `packDomain` and the `[]StartupDependency` form of `startsAfter`. Hand-written conversion with the stash (§5.2–5.3), plus fuzz and table tests. v1alpha1 CEL rules. Deprecation markers. Accessors on v1beta1 fields. Defaulting and validation, including the mutability rules and the strategy-switch rule (§4.4–4.5). Mutable minimum fields: the gang-shape hash and replica recreate, the availability overlay on preserved specs (§7.7). Scale guard. Per-component `breachTolerance`. Percentage `maxUnavailable` in update orchestration. `startsAfter` validation, and the per-dependency condition type passed to and enforced by `initc`. `MinAvailableBreached` awaiting states, with the PCSG upgrade carry-over (§7.6). Printer columns. v1beta1 status doc fixes (§11 item 17). | v1alpha1: none, except that `MinAvailableBreached` is `Unknown` during startup and a PCLQ's breach tolerance runs from its first schedule (§7.6). v1beta1-native: new semantics. |
+| **4** [4, 5, 6] | v1beta1 schema (§4.2–4.3), including dropping `packDomain` and the `[]StartupDependency` form of `startsAfter`. Hand-written conversion with the stash (§5.2–5.3), plus fuzz and table tests. v1alpha1 CEL rules. Deprecation markers. Accessors on v1beta1 fields. Defaulting and validation, including the mutability rules and the strategy-switch rule (§4.4–4.5). Mutable minimum fields: the gang-shape hash and replica recreate, the availability overlay on preserved specs (§7.7). The `autoScalingConfig.minReplicas` default and floor (§4.4–4.5). Scale guard. Per-component `breachTolerance`. Percentage `maxUnavailable` in update orchestration. `startsAfter` validation, and the per-dependency condition type passed to and enforced by `initc`. `MinAvailableBreached` awaiting states, with the PCSG upgrade carry-over (§7.6). Printer columns. v1beta1 status doc fixes (§11 item 17). | v1alpha1: none, except that `MinAvailableBreached` is `Unknown` during startup and a PCLQ's breach tolerance runs from its first schedule (§7.6). v1beta1-native: new semantics. |
 | **5** [8] | Storage switch and migrator (§7.4), the sticky-storage handling in the `crdInstaller` (§3), and the downgrade procedure (§7.5). | Storage only |
 | **6** [10] | Envtest and e2e from §9: upgrade from N-1 under live traffic, downgrade to N-1, operator restarts, the equivalence suites with v1alpha1 and v1beta1 manifests, Story 1 and the #859 scenario. | — |
 | **7** [7] | Docs and samples:<br>- `docs/api-reference` (add v1beta1 to `hack/generate-api-docs.sh`);<br>- user guide and samples on v1beta1, keeping one v1alpha1 sample. This includes the startup-ordering samples (`simple2`/`simple3-explicit-startup-order.yaml`) and the e2e workloads that use `startsAfter`;<br>- a migration guide with the §5.2 table. | — |
@@ -632,7 +633,13 @@ What one PR changes compared with a PR series:
     - each is rejected when `RequestKind` is v1alpha1;
     - a v1alpha1 strategy switch that drops `rollingUpdate.minReplicas` is still accepted;
     - a `rollingUpdate.minReplicas` change, or a switch away from `Coherent`, is rejected while a Coherent update is in progress and accepted once it has ended;
-    - changes that break the ordering or autoscaling rules are rejected;
+    - changes that break the ordering or autoscaling rules are rejected, including lowering `init.minReplicas` below the unit and raising `availability.minReplicas` above `autoScalingConfig.minReplicas`;
+  - `rollingUpdate.minReplicas` above `init.minReplicas` or above `replicas` is rejected;
+  - `autoScalingConfig.minReplicas`:
+    - with `availability` set, it defaults to `availability.minReplicas`, and a lower value is rejected;
+    - with `availability` nil, it defaults to `1`, and `1` is accepted;
+    - a v1alpha1 request still defaults it to `replicas`;
+  - the scale guard with `availability` nil accepts any `replicas ≥ 0`;
   - `startsAfter`: duplicate names, an invalid `conditionType` (including one containing `:`), changing any `conditionType` on update;
   - `startsAfter` condition types:
     - each built-in condition is accepted without a gate, and `DisruptionTarget` is rejected;
@@ -792,6 +799,13 @@ These were deferred. Release N is cut right after PR 1 (§8), so each needed a d
     - v1alpha1 requests cannot change any of them.
 
     The GREP's immutable-fields rule, its Test Plan and step 4 need the matching update. (Commit 4.)
+19. **Scaling floors** (§4.4–4.5):
+    - `rollingUpdate.minReplicas ≤ min(init.minReplicas, replicas)`;
+    - `autoScalingConfig.minReplicas` has the floor and default `availability.minReplicas`, or `1` when `availability` is nil;
+    - the scale guard uses the same floor, with `0` always allowed;
+    - v1alpha1 requests keep today's `replicas` default.
+
+    The GREP needs the `≤ init.minReplicas` bound, an `autoScalingConfig.minReplicas` row in its Defaults table, the autoscaling rule, and the nil floor for the scale guard. (Commit 4.)
 
 ### 11.3 `startsAfter` change (outside GREP-0877)
 
