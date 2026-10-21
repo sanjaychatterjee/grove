@@ -145,7 +145,31 @@ type AvailabilityPolicy struct {
 	// +optional
 	BreachTolerance *metav1.Duration `json:"breachTolerance,omitempty"`
 }
+
+// PodCliqueSetStatus (excerpt). GangShapeRecreate is new, in both versions (§7.7).
+type PodCliqueSetStatus struct {
+	// GangShapeRecreate is set while replicas with a stale gang shape are being recreated,
+	// and cleared once none is left.
+	// +optional
+	GangShapeRecreate *GangShapeRecreateProgress `json:"gangShapeRecreate,omitempty"`
+}
+
+type GangShapeRecreateProgress struct {
+	// StartedAt is when the first stale replica was found.
+	StartedAt metav1.Time `json:"startedAt"`
+	// GangShapeHash is the gang-shape hash the replicas are being recreated to.
+	GangShapeHash string `json:"gangShapeHash"`
+	// CurrentlyRecreating is the replica that was deleted last, until it is available again.
+	// +optional
+	CurrentlyRecreating *int32 `json:"currentlyRecreating,omitempty"`
+	// StaleReplicaIndices are the replicas still at an older gang shape, in recreate order.
+	// +optional
+	StaleReplicaIndices []int32 `json:"staleReplicaIndices,omitempty"`
+}
 ```
+
+- The field is in v1alpha1 as well, and conversion copies it. Before the storage switch in release N, storage is v1alpha1 and would otherwise prune it. N-1 never writes it.
+- The PCS also gets a `GangShapeRecreateInProgress` condition. It is `True` while `gangShapeRecreate` is set, with reason `RecreatingReplica` or `WaitingForAvailableReplicas`. It is `False` with reason `GangShapeCurrent` otherwise.
 
 The `startsAfter` change, which is outside GREP-0877:
 
@@ -543,14 +567,32 @@ At v1beta1, the three minimum fields can change (§4.5). Each has its own effect
 The mechanism:
 - **Detecting stale replicas.** The *gang-shape hash* covers every clique template's and every PCSG config's `init.minReplicas`, keyed by name. The PCS controller labels each replica's PCLQs and PCSGs with it (`grove.io/gang-shape-hash`). A replica is stale when any of its children carries a different value.
 - **Adopting unlabelled children.** A child without the label is adopted: the controller writes the current value and does not recreate the replica. So the upgrade, and objects created by N-1, recreate nothing.
-- **Pacing.** Replicas are recreated one at a time, lowest index first. The next starts once the recreated replica is available again.
+- **Order.** Replicas are recreated one at a time. The next one is chosen in this order:
+  1. the replica a rolling update had already started, if it is stale;
+  2. stale replicas that are not available, lowest index first;
+  3. the other stale replicas, lowest index first.
+
+  "Available" is the check behind PCS `availableReplicas`:
+  - every expected standalone PCLQ and PCSG exists and none is terminating;
+  - each standalone PCLQ has `readyReplicas ≥ ReadyThreshold`;
+  - each PCSG has `availableReplicas ≥ ReadyThreshold`;
+  - a child at `replicas: 0` counts as available.
+
+  Recreating unavailable replicas first restores the most capacity per disruption.
+- **Pacing.** A replica is deleted only when every replica that is not stale is available. This includes the replica recreated last, which is no longer stale once it is rebuilt. Stale replicas do not hold the recreate back, and a replica being gang-terminated counts as not available.
   - This applies under every strategy, including `OnDelete`, because the gang shape is not a pod-template change.
   - It reuses gang termination's replica delete task (`createPCSReplicaDeleteTask` in `podcliquesetreplica/gangterminate.go`), with the event reason `GangShapeChanged`.
   - The normal sync rebuilds the replica from the current template: its PCLQs, PCSGs, PodGangs and PodGangMap entries.
-- **Progress.** The recreate sets `status.updateProgress` the way a rolling update does. That suspends gang termination for the PCS while it runs, so a replica is never deleted twice. Under `Coherent`, it also freezes `rollingUpdate.minReplicas`.
+  - The order and the wait are worked out again on every reconcile from the gang-shape labels, so an operator restart resumes where it stopped.
+- **Status.** The recreate keeps `status.gangShapeRecreate` and the `GangShapeRecreateInProgress` condition current (§4.2). It sets them when the first stale replica is found and clears them once no replica is stale and `currentlyRecreating` is available.
+  - It does not use `status.updateProgress`. That field drives the pod-template rollout in the PCS, PCSG and PCLQ controllers, and the generation-hash counters in it don't move during a recreate.
+  - So the Coherent freeze of `rollingUpdate.minReplicas` (§4.5) still keys on `updateProgress` alone. The recreate does not read the unit.
+  - An `init.minReplicas` edit during a recreate changes the target hash. Status takes the new `gangShapeHash`, and replicas already recreated to the old target become stale again.
+- **Gang termination.** It is suspended only for `currentlyRecreating`, from the delete until that replica is available again, so the replica is never deleted twice. Other replicas still gang-terminate. Otherwise a replica that is not stale, cannot recover, and has gang termination suspended would block the wait forever. A stale replica that gang termination deletes is rebuilt at the new shape, so it counts as recreated.
 - **Interaction with updates.** A recreated replica comes up at the newest pod templates, so it counts as updated. The recreate takes precedence over an update in flight:
-  - the rolling update starts no new replica while any replica is stale;
-  - a replica the update had already started is recreated next.
+  - the rolling update starts no new replica while any replica is stale or `currentlyRecreating` is set;
+  - a replica the update had already started is recreated first (see **Order**).
+- **No deadline.** A recreated replica that never becomes available stalls the recreate. The condition shows it with reason `WaitingForAvailableReplicas`. Phase 1 adds no deadline.
 - **Disruptive by design.** Each recreate takes the whole replica down, base PodGang included. The field doc and the user guide say so.
 
 **`availability.minReplicas` changes in place.** Pods are not restarted, and no hash changes.
@@ -590,7 +632,7 @@ PR 1 is organized as eight commits, in this order. **Each commit builds and pass
 | **2** [2] | v1beta1 package as an identical copy of v1alpha1. Trivial generated conversion, registered as hub-and-spoke converters in the operator (§5.1). Multi-version CRDs (storage v1alpha1). `/convert`. The three converted CRDs get a fail-closed `Webhook` conversion at the default address, which the `crdInstaller` and the operator correct (§6.1, option B). `caBundle` injection and RBAC (§6.2). **Webhook rules switched to v1beta1 with `Equivalent`**, and `internal/webhook/...` handlers registered for v1beta1 types through the v1alpha1 bridge (§6.3). | None. The schemas are identical. |
 | **2b** | Serve the webhooks before the controllers are added, and move the PodGang migration gate from before `mgr.Start` to that point, with retries (§5.5). Without it, commit 3 would have the operator read PodCliqueSets through a `/convert` it does not serve yet. | None |
 | **3** [3] | Mechanical import switch (§7.2). The v1beta1 clients were already generated in commit 2. Removes the v1alpha1 bridge of the admission handlers (§6.3). | None |
-| **4** [4, 5, 6] | v1beta1 schema (§4.2–4.3), including dropping `packDomain` and the `[]StartupDependency` form of `startsAfter`. Hand-written conversion with the stash (§5.2–5.3), plus fuzz and table tests. v1alpha1 CEL rules. Deprecation markers. Accessors on v1beta1 fields. Defaulting and validation, including the mutability rules and the strategy-switch rule (§4.4–4.5). Mutable minimum fields: the gang-shape hash and replica recreate, the availability overlay on preserved specs (§7.7). The `autoScalingConfig.minReplicas` default and floor (§4.4–4.5). Scale guard. Per-component `breachTolerance`. Percentage `maxUnavailable` in update orchestration. `startsAfter` validation, and the per-dependency condition type passed to and enforced by `initc`. `MinAvailableBreached` awaiting states, with the PCSG upgrade carry-over (§7.6). Printer columns. v1beta1 status doc fixes (§11 item 17). | v1alpha1: none, except that `MinAvailableBreached` is `Unknown` during startup and a PCLQ's breach tolerance runs from its first schedule (§7.6). v1beta1-native: new semantics. |
+| **4** [4, 5, 6] | v1beta1 schema (§4.2–4.3), including dropping `packDomain` and the `[]StartupDependency` form of `startsAfter`. Hand-written conversion with the stash (§5.2–5.3), plus fuzz and table tests. v1alpha1 CEL rules. Deprecation markers. Accessors on v1beta1 fields. Defaulting and validation, including the mutability rules and the strategy-switch rule (§4.4–4.5). Mutable minimum fields: the gang-shape hash and replica recreate, with `status.gangShapeRecreate` and its condition, the availability overlay on preserved specs (§7.7). The `autoScalingConfig.minReplicas` default and floor (§4.4–4.5). Scale guard. Per-component `breachTolerance`. Percentage `maxUnavailable` in update orchestration. `startsAfter` validation, and the per-dependency condition type passed to and enforced by `initc`. `MinAvailableBreached` awaiting states, with the PCSG upgrade carry-over (§7.6). Printer columns. v1beta1 status doc fixes (§11 item 17). | v1alpha1: none, except that `MinAvailableBreached` is `Unknown` during startup and a PCLQ's breach tolerance runs from its first schedule (§7.6). v1beta1-native: new semantics. |
 | **5** [8] | Storage switch and migrator (§7.4), the sticky-storage handling in the `crdInstaller` (§3), and the downgrade procedure (§7.5). | Storage only |
 | **6** [10] | Envtest and e2e from §9: upgrade from N-1 under live traffic, downgrade to N-1, operator restarts, the equivalence suites with v1alpha1 and v1beta1 manifests, Story 1 and the #859 scenario. | — |
 | **7** [7] | Docs and samples:<br>- `docs/api-reference` (add v1beta1 to `hack/generate-api-docs.sh`);<br>- user guide and samples on v1beta1, keeping one v1alpha1 sample. This includes the startup-ordering samples (`simple2`/`simple3-explicit-startup-order.yaml`) and the e2e workloads that use `startsAfter`;<br>- a migration guide with the §5.2 table. | — |
@@ -650,6 +692,12 @@ What one PR changes compared with a PR series:
   - the gang-shape hash changes with any `init.minReplicas` and with nothing else;
   - an unlabelled child is adopted, not recreated;
   - a stale replica is deleted through the replica delete task, one replica at a time, under each strategy;
+  - the recreate order: the replica the rolling update had started, then stale replicas that are not available, then the other stale replicas, each by lowest index;
+  - no replica is deleted while a non-stale replica, including the one recreated last, is not available, and stale replicas don't hold the recreate back;
+  - `status.gangShapeRecreate` and the `GangShapeRecreateInProgress` condition are set at the first stale replica, track `currentlyRecreating` and the remaining order, and are cleared at the end; `status.updateProgress` is untouched;
+  - gang termination skips `currentlyRecreating` and still fires for other replicas;
+  - an `init.minReplicas` edit mid-recreate updates `gangShapeHash` and marks the replicas already recreated as stale again;
+  - `gangShapeRecreate` round-trips through v1alpha1;
   - the rolling update starts no replica while one is stale;
   - a changed `availability` reaches PCLQs whose spec is preserved during a Coherent update, and PCSG members;
   - neither pod-template hash nor generation hash changes with `availability.minReplicas` or `rollingUpdate.minReplicas`.
@@ -703,7 +751,8 @@ What one PR changes compared with a PR series:
   - A Coherent update with `rollingUpdate.minReplicas` larger than `availability.minReplicas` rolls in the larger unit.
   - A percentage `maxUnavailable` is resolved correctly before and after scaling, and also after a scale-out or scale-in in the middle of an update, where the next reconcile uses the new budget (§11 item 8).
   - `rollingUpdate.minReplicas` is rejected under `RollingRecreate` and `OnDelete`, filled in when switching to `Coherent`, and must be removed when switching away.
-  - Raising `init.minReplicas` recreates the PCS replicas one at a time, with the next starting only once the previous is available. Afterwards the PodGangs and the init-container args carry the new count. This is tested under `RollingRecreate`, `Coherent` and `OnDelete`.
+  - Raising `init.minReplicas` recreates the PCS replicas one at a time, with the next starting only once every non-stale replica is available. Afterwards the PodGangs and the init-container args carry the new count. This is tested under `RollingRecreate`, `Coherent` and `OnDelete`.
+  - With one stale replica made unavailable, that replica is recreated first. `status.gangShapeRecreate` and the condition are visible during the recreate and cleared afterwards. A breach on a replica not being recreated still gang-terminates it.
   - Raising `availability.minReplicas` above the ready pods gang-terminates after `breachTolerance`. Lowering it clears the breach. No pod is restarted in either case.
   - Changing `rollingUpdate.minReplicas` rolls no pods. The next pod-template change rolls in the new unit.
   - The upgrade test also asserts that no replica is recreated for a missing gang-shape label.
@@ -742,7 +791,8 @@ What one PR changes compared with a PR series:
 | **Clients rely on `MinAvailableBreached=True` during startup** (scripts, dashboards, `kubectl wait`) | Release notes (§8 commit 8). Grove's own consumers change in the same commit (§7.6). The awaiting reasons name the state explicitly. |
 | **An upgrade gang-terminates, or spares, a PCSG differently from N-1** | The carry-over reads N-1 conditions with today's `WasPCSGEverHealthy` (§7.6), covered by unit cases per condition shape and by the upgrade e2e. |
 | **A user upgrades from N-1 directly to N+1 or later** | Not supported (§3), and the release notes say so. The carry-over and the storage migration exist only in N. |
-| **An `init.minReplicas` edit takes replicas down** | Intended (§7.7). Replicas are recreated one at a time, each only after the previous one is available again. The field doc and the user guide say so. v1alpha1 clients cannot trigger it. |
+| **An `init.minReplicas` edit takes replicas down** | Intended (§7.7). Replicas are recreated one at a time, each only once every non-stale replica is available, and unavailable replicas go first. Gang termination is suspended only for the replica being recreated. The field doc and the user guide say so. v1alpha1 clients cannot trigger it. |
+| **A recreate stalls** because a recreated replica never becomes available | Visible as `GangShapeRecreateInProgress=True` with reason `WaitingForAvailableReplicas`, and in `status.gangShapeRecreate` (§7.7). There is no deadline in Phase 1. |
 | **The upgrade recreates replicas** because existing children have no gang-shape label | An unlabelled child is adopted, not recreated (§7.7). Unit and upgrade e2e tests cover it. |
 | **Raising `availability.minReplicas` gang-terminates a running replica** | Intended and documented: the new floor applies at once, and termination waits `breachTolerance`. |
 | **A unit change mid-update splits a Coherent update** | Admission freezes `rollingUpdate.minReplicas` and the strategy while a Coherent update is in progress (§4.5). |
