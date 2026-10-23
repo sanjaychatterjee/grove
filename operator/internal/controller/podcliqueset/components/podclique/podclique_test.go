@@ -580,6 +580,42 @@ func TestBuildResource_PreservesRevisionForReplicaNotUnderCoherentUpdate(t *test
 	}
 }
 
+// TestBuildResource_PreservesMinAvailable verifies that an existing PodClique keeps the minAvailable it was
+// created with when its template changes, so its gang shape only changes when its PodCliqueSet replica is
+// recreated.
+func TestBuildResource_PreservesMinAvailable(t *testing.T) {
+	const cliqueName = "worker"
+	testCases := []struct {
+		description      string
+		existing         *int32
+		pclqExists       bool
+		wantMinAvailable int32
+	}{
+		{"a new PodClique gets the template minAvailable", nil, false, 2},
+		{"an existing PodClique keeps its minAvailable", ptr.To(int32(1)), true, 1},
+		{"an existing PodClique without minAvailable gets the template minAvailable", nil, true, 2},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.description, func(t *testing.T) {
+			template := testutils.NewPodCliqueTemplateSpecBuilder(cliqueName).WithReplicas(3).WithMinAvailable(2).Build()
+			pcs := testutils.NewPodCliqueSetBuilder(testPCSName, testPCSNamespace, uuid.NewUUID()).
+				WithReplicas(1).
+				WithCliqueStartupType(ptr.To(grovecorev1alpha1.CliqueStartupTypeAnyOrder)).
+				WithPodCliqueTemplateSpec(template).
+				Build()
+			pclq := &grovecorev1alpha1.PodClique{
+				ObjectMeta: metav1.ObjectMeta{Name: fmt.Sprintf("%s-0-%s", testPCSName, cliqueName), Namespace: testPCSNamespace},
+				Spec:       grovecorev1alpha1.PodCliqueSpec{Replicas: 3, MinAvailable: tc.existing},
+			}
+
+			operator := &_resource{scheme: groveclientscheme.Scheme}
+			require.NoError(t, operator.buildResource(logr.Discard(), pcs, 0, tc.pclqExists, pclq))
+			require.NotNil(t, pclq.Spec.MinAvailable)
+			assert.Equal(t, tc.wantMinAvailable, *pclq.Spec.MinAvailable)
+		})
+	}
+}
+
 // TestBuildResource_DoesNotWriteStartsAfter asserts the controller treats StartsAfter as user-declared
 // desired state and never writes it. A preserved replica keeps whatever StartsAfter it already carries, even
 // a stale fully qualified value left by an older operator, since the controller does not reconcile the field

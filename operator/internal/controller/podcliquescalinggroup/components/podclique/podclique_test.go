@@ -657,6 +657,33 @@ func TestBuildResource_StripsTopologyAnnotation(t *testing.T) {
 	assert.False(t, hasTopologyAnnotation)
 }
 
+// TestBuildResource_PreservesMinAvailable verifies that an existing PCSG member PodClique keeps the minAvailable
+// it was created with when its template changes, so its gang shape only changes when its PodCliqueSet replica is
+// recreated.
+func TestBuildResource_PreservesMinAvailable(t *testing.T) {
+	testCases := []struct {
+		description      string
+		existing         *int32
+		pclqExists       bool
+		wantMinAvailable int32
+	}{
+		{"a new PodClique gets the template minAvailable", nil, false, 1},
+		{"an existing PodClique keeps its minAvailable", ptr.To(int32(2)), true, 2},
+		{"an existing PodClique without minAvailable gets the template minAvailable", nil, true, 1},
+	}
+	operator := &_resource{scheme: groveclientscheme.Scheme}
+	for _, tc := range testCases {
+		t.Run(tc.description, func(t *testing.T) {
+			ss := &syncSnapshot{pcs: newBuildResourcePCS("worker", nil, nil, nil), pcsg: newBuildResourcePCSG(nil), pcsReplicaIndex: 0, pgm: newAnchorPodGangMap()}
+			pclq := emptyMemberPodClique("test-pcs-0-sg-0-worker")
+			pclq.Spec.MinAvailable = tc.existing
+			require.NoError(t, operator.buildResource(logr.Discard(), ss, 0, pclq, tc.pclqExists))
+			require.NotNil(t, pclq.Spec.MinAvailable)
+			assert.Equal(t, tc.wantMinAvailable, *pclq.Spec.MinAvailable)
+		})
+	}
+}
+
 func TestSyncPCSGPodIndexOffsetsUsesCurrentReplicaCounts(t *testing.T) {
 	pcs := &grovecorev1alpha1.PodCliqueSet{
 		ObjectMeta: metav1.ObjectMeta{Name: "test-pcs", Namespace: "default"},

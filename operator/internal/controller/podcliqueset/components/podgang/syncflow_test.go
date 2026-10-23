@@ -52,6 +52,19 @@ var defaultFakeSchedulerRegistry = &testutils.FakeSchedulerRegistry{
 	DefaultBackend: "default-scheduler",
 }
 
+// TestPCLQMinAvailable verifies that a PodGang takes MinReplicas from the existing PodClique, which keeps the
+// minAvailable it was created with until its PodCliqueSet replica is recreated, and from the template otherwise.
+func TestPCLQMinAvailable(t *testing.T) {
+	template := &grovecorev1alpha1.PodCliqueTemplateSpec{Name: "a", Spec: grovecorev1alpha1.PodCliqueSpec{MinAvailable: ptr.To(int32(3))}}
+	ss := &syncState{existingPCLQByName: map[string]grovecorev1alpha1.PodClique{
+		"pcs-0-a": {Spec: grovecorev1alpha1.PodCliqueSpec{MinAvailable: ptr.To(int32(1))}},
+		"pcs-1-a": {},
+	}}
+	assert.Equal(t, int32(1), ss.pclqMinAvailable("pcs-0-a", template), "existing PodClique")
+	assert.Equal(t, int32(3), ss.pclqMinAvailable("pcs-1-a", template), "existing PodClique without minAvailable")
+	assert.Equal(t, int32(3), ss.pclqMinAvailable("pcs-2-a", template), "PodClique not created yet")
+}
+
 // TestVerifyAllPodsCreated tests verifyAllPodsCreated with a minimal syncState and podGangInfo (no
 // PCS/prepareSyncFlow). It covers the constituent-PodClique existence check and the requeue-versus-
 // success gate for a single PodGang, whose pod accounting is delegated to

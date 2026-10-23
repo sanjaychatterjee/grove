@@ -364,8 +364,14 @@ func (r _resource) buildResource(logger logr.Logger, ss *syncSnapshot, pcsgRepli
 	if pclqExists {
 		// If an HPA is mutating the number of replicas, then it should not be overwritten by the template spec replicas.
 		currentPCLQReplicas := pclq.Spec.Replicas
+		// MinAvailable fixes the gang shape the PodClique was created with. A changed template value reaches the
+		// PodClique only when the gang-shape recreate rebuilds its PodCliqueSet replica.
+		currentPCLQMinAvailable := pclq.Spec.MinAvailable
 		pclq.Spec = *pclqTemplateSpec.Spec.DeepCopy()
 		pclq.Spec.Replicas = currentPCLQReplicas
+		if currentPCLQMinAvailable != nil {
+			pclq.Spec.MinAvailable = currentPCLQMinAvailable
+		}
 	} else {
 		pclq.Spec = *pclqTemplateSpec.Spec.DeepCopy()
 	}

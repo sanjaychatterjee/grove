@@ -342,10 +342,16 @@ func setPodCliqueSpec(logger logr.Logger, pcs *grovecorev1alpha1.PodCliqueSet, p
 	if pclqExists {
 		// If an HPA is mutating the number of replicas, then it should not be overwritten by the template spec replicas.
 		preservedReplicas := pclq.Spec.Replicas
+		// MinAvailable fixes the gang shape the PodClique was created with. A changed template value reaches the
+		// PodClique only when the gang-shape recreate rebuilds its PodCliqueSet replica.
+		preservedMinAvailable := pclq.Spec.MinAvailable
 		if !preserveRevision {
 			pclq.Spec = *pclqTemplate.Spec.DeepCopy()
 		}
 		pclq.Spec.Replicas = preservedReplicas
+		if preservedMinAvailable != nil {
+			pclq.Spec.MinAvailable = preservedMinAvailable
+		}
 	} else {
 		pclq.Spec = *pclqTemplate.Spec.DeepCopy()
 	}

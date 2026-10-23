@@ -633,7 +633,7 @@ func TestImmutableFieldsValidation(t *testing.T) {
 			expectedErrMsg: "field is immutable",
 		},
 		{
-			name: "Invalid: MinAvailable is immutable",
+			name: "Valid: MinAvailable can be updated",
 			setupOldPCS: func() *grovecorev1alpha1.PodCliqueSet {
 				pcs := createTestPodCliqueSet("test")
 				pcs.Spec.Template.Cliques[0].Spec.MinAvailable = ptr.To(int32(1))
@@ -644,8 +644,7 @@ func TestImmutableFieldsValidation(t *testing.T) {
 				pcs.Spec.Template.Cliques[0].Spec.MinAvailable = ptr.To(int32(2))
 				return pcs
 			},
-			expectError:    true,
-			expectedErrMsg: "field is immutable",
+			expectError: false,
 		},
 		{
 			name: "Invalid: StartsAfter is immutable",
@@ -673,14 +672,12 @@ func TestImmutableFieldsValidation(t *testing.T) {
 			setupOldPCS: func() *grovecorev1alpha1.PodCliqueSet {
 				pcs := createTestPodCliqueSet("test")
 				pcs.Spec.Template.Cliques[0].Spec.RoleName = "old-role"
-				pcs.Spec.Template.Cliques[0].Spec.MinAvailable = ptr.To(int32(1))
 				pcs.Spec.Template.Cliques[0].Spec.StartsAfter = []string{"dep1"}
 				return pcs
 			},
 			setupNewPCS: func() *grovecorev1alpha1.PodCliqueSet {
 				pcs := createTestPodCliqueSet("test")
 				pcs.Spec.Template.Cliques[0].Spec.RoleName = "new-role"
-				pcs.Spec.Template.Cliques[0].Spec.MinAvailable = ptr.To(int32(2))
 				pcs.Spec.Template.Cliques[0].Spec.StartsAfter = []string{"dep1", "dep2"}
 				return pcs
 			},
@@ -839,7 +836,7 @@ func TestPodCliqueScalingGroupConfigsUpdateValidation(t *testing.T) {
 			expectedErrMsg: "field is immutable",
 		},
 		{
-			name: "different min available - should fail",
+			name: "different min available - should pass",
 			oldConfigs: []grovecorev1alpha1.PodCliqueScalingGroupConfig{
 				{
 					CliqueNames:  []string{"clique1", "clique2"},
@@ -852,8 +849,7 @@ func TestPodCliqueScalingGroupConfigsUpdateValidation(t *testing.T) {
 					MinAvailable: ptr.To(int32(2)),
 				},
 			},
-			expectedErrors: true,
-			expectedErrMsg: "field is immutable",
+			expectedErrors: false,
 		},
 		{
 			name: "adding new config - should fail",
@@ -926,7 +922,7 @@ func TestPodCliqueScalingGroupConfigsUpdateValidation(t *testing.T) {
 			expectedErrors: false,
 		},
 		{
-			name: "nil to non-nil min available - should fail",
+			name: "nil to non-nil min available - should pass",
 			oldConfigs: []grovecorev1alpha1.PodCliqueScalingGroupConfig{
 				{
 					CliqueNames:  []string{"clique1"},
@@ -939,8 +935,7 @@ func TestPodCliqueScalingGroupConfigsUpdateValidation(t *testing.T) {
 					MinAvailable: ptr.To(int32(1)),
 				},
 			},
-			expectedErrors: true,
-			expectedErrMsg: "field is immutable",
+			expectedErrors: false,
 		},
 		{
 			name: "same resourceSharing - should pass",

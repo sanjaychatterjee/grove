@@ -108,6 +108,33 @@ type PodCliqueSetStatus struct {
 	CurrentGenerationHash *string `json:"currentGenerationHash,omitempty"`
 	// UpdateProgress represents the progress of an update.
 	UpdateProgress *PodCliqueSetUpdateProgress `json:"updateProgress,omitempty"`
+	// GangShapeRecreate is set while PodCliqueSet replicas whose gang shape is stale, after a MinAvailable change
+	// in a clique template or a PodCliqueScalingGroup config, are being recreated. It is cleared once none is left.
+	// +optional
+	GangShapeRecreate *GangShapeRecreateProgress `json:"gangShapeRecreate,omitempty"`
+}
+
+// GangShapeRecreateProgress captures the progress of recreating the PodCliqueSet replicas whose gang shape is stale.
+// A replica is stale when the MinAvailable of one of its PodCliques or PodCliqueScalingGroups differs from the
+// PodCliqueSet template. Stale replicas are deleted and recreated one at a time.
+type GangShapeRecreateProgress struct {
+	// StartedAt is the time at which the first stale replica was found.
+	StartedAt metav1.Time `json:"startedAt"`
+	// CurrentlyRecreating is the replica that was deleted last. It is cleared once that replica is rebuilt, and also
+	// available again if it was available when it was deleted.
+	// +optional
+	CurrentlyRecreating *PodCliqueSetReplicaRecreateProgress `json:"currentlyRecreating,omitempty"`
+}
+
+// PodCliqueSetReplicaRecreateProgress captures the recreate of one PodCliqueSet replica.
+type PodCliqueSetReplicaRecreateProgress struct {
+	// ReplicaIndex is the index of the PodCliqueSet replica being recreated.
+	ReplicaIndex int32 `json:"replicaIndex"`
+	// WasAvailable reports whether the replica was available when it was deleted.
+	// +optional
+	WasAvailable bool `json:"wasAvailable,omitempty"`
+	// StartedAt is the time at which the replica was deleted.
+	StartedAt metav1.Time `json:"startedAt"`
 }
 
 // PodCliqueSetUpdateStrategy defines the update strategy for a PodCliqueSet.
@@ -455,6 +482,10 @@ type PodCliqueScalingGroupConfig struct {
 	// Constraints:
 	// MinAvailable cannot be greater than Replicas.
 	// If ScaleConfig is defined then its MinAvailable should not be less than ScaleConfig.MinReplicas.
+	// Mutability:
+	// MinAvailable fixes the gang shape of every PodCliqueSet replica, so changing it deletes and recreates every
+	// PodCliqueSet replica, one at a time and under every update strategy, OnDelete included. An update in progress
+	// is cancelled in favour of the recreate. Each recreate takes the whole replica down until it is rebuilt.
 	// +optional
 	// +kubebuilder:default=1
 	MinAvailable *int32 `json:"minAvailable,omitempty"`

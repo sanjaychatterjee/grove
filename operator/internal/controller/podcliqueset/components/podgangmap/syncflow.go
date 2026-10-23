@@ -16,6 +16,7 @@ package podgangmap
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"slices"
 	"strconv"
@@ -186,7 +187,9 @@ type mvuTemplate struct {
 
 // computeMVUTemplate builds the mvuTemplate from the in-scope component set that
 // PCS.Status.UpdateProgress froze when the coherent update started. MinAvailable values are read
-// from the PCS spec, which the validating webhook holds unchanged for the duration of the update.
+// from the PCS spec. A MinAvailable change during the update starts a gang-shape recreate, which
+// recreates the replica under the coherent update first and clears it from UpdateProgress, so no
+// replica is advanced with a MinAvailable other than the one its PodGangMap was built for.
 func computeMVUTemplate(pcs *grovecorev1alpha1.PodCliqueSet) *mvuTemplate {
 	progress := pcs.Status.UpdateProgress
 	inScopeComponentNames := slices.Concat(progress.InScopeStandalonePodCliques, progress.InScopePodCliqueScalingGroups)
@@ -228,23 +231,38 @@ func (r _resource) runSyncFlow(ctx context.Context, syncSnap *syncSnapshot) erro
 		}
 
 		pgmName := apicommon.GeneratePodGangMapName(apicommon.ResourceNameReplica{Name: syncSnap.pcs.Name, Replica: pcsReplicaIndex})
-		if err = r.createOrPatchPodGangMap(ctx, syncSnap.pcs, pgmName, pcsReplicaIndex, entries); err != nil {
+		if err = r.createOrPatchPodGangMap(ctx, syncSnap.pcs, pgmName, pcsReplicaIndex, entries, pgm != nil); err != nil {
 			return err
 		}
 	}
 	return r.deleteOrphanedPodGangMaps(ctx, syncSnap)
 }
 
-// createOrPatchPodGangMap creates or patches the named PodGangMap with the given entries.
+// createOrPatchPodGangMap creates or patches the named PodGangMap with the given entries. inSnapshot
+// reports whether the snapshot the entries were authored from held the PodGangMap.
+//
+// A PodGangMap that was in the snapshot but no longer exists was deleted during this reconcile, by a gang
+// termination or a gang-shape recreate of its replica, after the snapshot was read from the cache. Its
+// entries were authored from the deleted PodGangMap, so it is not recreated from them. The reconcile is
+// requeued instead, and the next one bootstraps a fresh PodGangMap for the replica.
 func (r _resource) createOrPatchPodGangMap(ctx context.Context,
 	pcs *grovecorev1alpha1.PodCliqueSet,
 	pgmName string,
 	pcsReplicaIndex int,
-	entries []grovecorev1alpha1.PodGangEntry) error {
+	entries []grovecorev1alpha1.PodGangEntry,
+	inSnapshot bool) error {
 	pgm := emptyPodGangMap(client.ObjectKey{Namespace: pcs.Namespace, Name: pgmName})
 	if _, err := k8sutils.CreateOrPatchSpec(ctx, r.client, pgm, func() error {
+		if inSnapshot && pgm.ResourceVersion == "" {
+			return groveerr.New(groveerr.ErrCodeRequeueAfter, component.OperationSync,
+				fmt.Sprintf("PodGangMap %s was deleted after the snapshot was taken, re-queueing to rebuild it", pgmName))
+		}
 		return r.buildResource(pgm, pcs, pcsReplicaIndex, entries)
 	}); err != nil {
+		var groveErr *groveerr.GroveError
+		if errors.As(err, &groveErr) && groveErr.Code == groveerr.ErrCodeRequeueAfter {
+			return err
+		}
 		return groveerr.WrapError(err, errCodeCreateOrPatchPodGangMap, component.OperationSync,
 			fmt.Sprintf("Error creating or updating PodGangMap %s for PodCliqueSet: %v", pgmName, client.ObjectKeyFromObject(pcs)))
 	}

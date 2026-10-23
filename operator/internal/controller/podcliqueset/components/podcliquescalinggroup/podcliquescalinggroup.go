@@ -218,7 +218,11 @@ func (r _resource) buildResource(pcsg *grovecorev1alpha1.PodCliqueScalingGroup, 
 	if !pcsgExists {
 		pcsg.Spec.Replicas = *pcsgConfig.Replicas
 	}
-	pcsg.Spec.MinAvailable = pcsgConfig.MinAvailable
+	// MinAvailable fixes the gang shape the PCSG was created with. A changed template value reaches an existing
+	// PCSG only when the gang-shape recreate or a gang termination rebuilds its PodCliqueSet replica.
+	if !pcsgExists || pcsg.Spec.MinAvailable == nil {
+		pcsg.Spec.MinAvailable = pcsgConfig.MinAvailable
+	}
 	pcsg.Spec.CliqueNames = pcsgConfig.CliqueNames
 	pcsg.Labels = getLabels(pcs, pcsReplica, client.ObjectKeyFromObject(pcsg))
 	pcsg.Annotations = getAnnotations(pcsgConfig)

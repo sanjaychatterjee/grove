@@ -719,6 +719,10 @@ spec:
                                 2. It defines the minimum requirement of available pods in a PodClique. Violation of this threshold will result
                                 in termination of the PodGang that it belongs to.
                                 If MinAvailable is not set, then it defaults to 1.
+                                Changing MinAvailable in a PodCliqueSet clique template changes the gang shape of every PodCliqueSet replica, so
+                                every replica is deleted and recreated, one at a time and under every update strategy, OnDelete included. An
+                                update in progress is cancelled in favour of the recreate. Each recreate takes the whole replica down until it
+                                is rebuilt.
                               format: int32
                               type: integer
                             podSpec:
@@ -9535,6 +9539,10 @@ spec:
                             Constraints:
                             MinAvailable cannot be greater than Replicas.
                             If ScaleConfig is defined then its MinAvailable should not be less than ScaleConfig.MinReplicas.
+                            Mutability:
+                            MinAvailable fixes the gang shape of every PodCliqueSet replica, so changing it deletes and recreates every
+                            PodCliqueSet replica, one at a time and under every update strategy, OnDelete included. An update in progress
+                            is cancelled in favour of the recreate. Each recreate takes the whole replica down until it is rebuilt.
                           format: int32
                           type: integer
                         name:
@@ -11144,6 +11152,42 @@ spec:
                   Only if this value is not nil and the newly computed hash value is different from the persisted CurrentGenerationHash value
                   then an update needs to be triggered.
                 type: string
+              gangShapeRecreate:
+                description: |-
+                  GangShapeRecreate is set while PodCliqueSet replicas whose gang shape is stale, after a MinAvailable change
+                  in a clique template or a PodCliqueScalingGroup config, are being recreated. It is cleared once none is left.
+                properties:
+                  currentlyRecreating:
+                    description: |-
+                      CurrentlyRecreating is the replica that was deleted last. It is cleared once that replica is rebuilt, and also
+                      available again if it was available when it was deleted.
+                    properties:
+                      replicaIndex:
+                        description: ReplicaIndex is the index of the PodCliqueSet
+                          replica being recreated.
+                        format: int32
+                        type: integer
+                      startedAt:
+                        description: StartedAt is the time at which the replica was
+                          deleted.
+                        format: date-time
+                        type: string
+                      wasAvailable:
+                        description: WasAvailable reports whether the replica was
+                          available when it was deleted.
+                        type: boolean
+                    required:
+                    - replicaIndex
+                    - startedAt
+                    type: object
+                  startedAt:
+                    description: StartedAt is the time at which the first stale replica
+                      was found.
+                    format: date-time
+                    type: string
+                required:
+                - startedAt
+                type: object
               hpaPodSelector:
                 description: |-
                   Selector is the label selector that determines which pods are part of the PodGang.

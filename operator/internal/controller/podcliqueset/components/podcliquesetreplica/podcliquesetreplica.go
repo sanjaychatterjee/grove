@@ -34,6 +34,7 @@ import (
 
 const (
 	errCodeComputingPCSReplicaDeletionWork grovecorev1alpha1.ErrorCode = "ERR_COMPUTE_PCS_REPLICA_DELETION_WORK"
+	errCodeComputingGangShapeWork          grovecorev1alpha1.ErrorCode = "ERR_COMPUTE_GANG_SHAPE_WORK"
 	errCodeDeletePCSReplica                grovecorev1alpha1.ErrorCode = "ERR_DELETE_PCS_REPLICA"
 	errCodeListPCLQs                       grovecorev1alpha1.ErrorCode = "ERR_LIST_PCLQs"
 	errCodeListPCSGs                       grovecorev1alpha1.ErrorCode = "ERR_LIST_PCGS"
@@ -60,7 +61,8 @@ func (r _resource) GetExistingResourceNames(_ context.Context, _ logr.Logger, _ 
 	return []string{}, nil
 }
 
-// Sync orchestrates replica deletion and rolling updates for the PodCliqueSet.
+// Sync orchestrates replica deletion, the recreate of replicas with a stale gang shape, and rolling updates for the
+// PodCliqueSet.
 func (r _resource) Sync(ctx context.Context, logger logr.Logger, pcs *grovecorev1alpha1.PodCliqueSet) error {
 	pcsObjectKey := client.ObjectKeyFromObject(pcs)
 
@@ -80,6 +82,34 @@ func (r _resource) Sync(ctx context.Context, logger logr.Logger, pcs *grovecorev
 				fmt.Sprintf("Error deleting PodCliques for PodCliqueSet: %v", pcsObjectKey),
 			)
 		}
+	}
+
+	gangShapeWork, err := r.getGangShapeWork(ctx, logger, pcs, delWork.pcsIndicesToTerminate)
+	if err != nil {
+		return groveerr.WrapError(err,
+			errCodeComputingGangShapeWork,
+			component.OperationSync,
+			fmt.Sprintf("Could not compute gang-shape recreate work for PCS: %v", pcsObjectKey))
+	}
+	if err = r.patchGangShapeRecreateStatus(ctx, logger, pcs, gangShapeWork); err != nil {
+		return err
+	}
+	if gangShapeWork.recreateTask != nil {
+		if err = gangShapeWork.recreateTask.Fn(ctx); err != nil {
+			return groveerr.WrapError(err,
+				errCodeDeletePCSReplica,
+				component.OperationSync,
+				fmt.Sprintf("Error recreating a replica with a stale gang shape for PodCliqueSet: %v", pcsObjectKey),
+			)
+		}
+	}
+	// A rolling update waits while replicas are recreated with the current gang shape. The recreated replicas
+	// get the current pod templates as well, so the update has less left to do once the recreate is done.
+	if gangShapeWork.inProgress() {
+		return groveerr.New(groveerr.ErrCodeContinueReconcileAndRequeue,
+			component.OperationSync,
+			"Requeuing to continue recreating PodCliqueSet replicas with a stale gang shape",
+		)
 	}
 
 	// Orchestrate the rolling update (RollingRecreate or Coherent) while one is in progress.

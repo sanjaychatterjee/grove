@@ -146,6 +146,9 @@ const (
 	// True means an update is progressing, False means no update is active, and Unknown means the update has not
 	// made progress within its configured ProgressDeadline and warrants operator inspection.
 	ConditionTypeUpdateInProgress = "UpdateInProgress"
+	// ConditionTypeGangShapeRecreateInProgress indicates whether PodCliqueSet replicas whose gang shape is stale, after
+	// a MinAvailable change, are being recreated. It is True while status.gangShapeRecreate is set.
+	ConditionTypeGangShapeRecreateInProgress = "GangShapeRecreateInProgress"
 )
 
 // Constants for Condition Reasons.
@@ -187,6 +190,15 @@ const (
 	// ConditionReasonAllTopologyLevelsAvailable indicates that all required topology levels defined on a
 	// PodCliqueSet for topology-aware scheduling are defined in the ClusterTopologyBinding resource.
 	ConditionReasonAllTopologyLevelsAvailable = "AllClusterTopologyLevelsAvailable"
+	// ConditionReasonRecreatingReplica indicates that a PodCliqueSet replica with a stale gang shape has been deleted
+	// and is not rebuilt yet, or is not available again yet after it was deleted while available.
+	ConditionReasonRecreatingReplica = "RecreatingReplica"
+	// ConditionReasonWaitingForNewShapeAvailable indicates that the gang-shape recreate does not delete an available
+	// replica until a replica that has the current gang shape is available, which shows that the new gang shape can
+	// be scheduled.
+	ConditionReasonWaitingForNewShapeAvailable = "WaitingForNewShapeAvailable"
+	// ConditionReasonGangShapeCurrent indicates that every PodCliqueSet replica has the current gang shape.
+	ConditionReasonGangShapeCurrent = "GangShapeCurrent"
 )
 
 const (

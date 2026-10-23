@@ -538,6 +538,42 @@ func TestBuildResource(t *testing.T) {
 	}
 }
 
+// TestBuildResource_PreservesMinAvailable verifies that an existing PCSG keeps the minAvailable it was created
+// with when the config changes, so its gang shape only changes when its PodCliqueSet replica is recreated.
+func TestBuildResource_PreservesMinAvailable(t *testing.T) {
+	pcs := &grovecorev1alpha1.PodCliqueSet{ObjectMeta: metav1.ObjectMeta{Name: "test-pcs", Namespace: "default", UID: "pcs-uid"}}
+	pcsgCfg := grovecorev1alpha1.PodCliqueScalingGroupConfig{
+		Name:         "pcsg1",
+		MinAvailable: ptr.To(int32(2)),
+		Replicas:     ptr.To(int32(3)),
+		CliqueNames:  []string{"clique1"},
+	}
+	testCases := []struct {
+		description      string
+		existing         *int32
+		pcsgExists       bool
+		wantMinAvailable int32
+	}{
+		{"a new PCSG gets the config minAvailable", nil, false, 2},
+		{"an existing PCSG keeps its minAvailable", ptr.To(int32(1)), true, 1},
+		{"an existing PCSG without minAvailable gets the config minAvailable", nil, true, 2},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.description, func(t *testing.T) {
+			scheme := runtime.NewScheme()
+			require.NoError(t, grovecorev1alpha1.AddToScheme(scheme))
+			r := &_resource{scheme: scheme}
+			pcsg := &grovecorev1alpha1.PodCliqueScalingGroup{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-pcs-0-pcsg1", Namespace: "default"},
+				Spec:       grovecorev1alpha1.PodCliqueScalingGroupSpec{Replicas: 3, MinAvailable: tc.existing},
+			}
+			require.NoError(t, r.buildResource(pcsg, pcs, 0, pcsgCfg, tc.pcsgExists))
+			require.NotNil(t, pcsg.Spec.MinAvailable)
+			assert.Equal(t, tc.wantMinAvailable, *pcsg.Spec.MinAvailable)
+		})
+	}
+}
+
 // TestBuildResource_MNNVLAnnotationPropagation tests that the MNNVL annotation is properly propagated from PCS to PCSG.
 func TestBuildResource_MNNVLAnnotationPropagation(t *testing.T) {
 	tests := []struct {

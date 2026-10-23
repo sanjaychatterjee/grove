@@ -22,6 +22,7 @@ import (
 	apicommon "github.com/ai-dynamo/grove/operator/api/common"
 	apiconstants "github.com/ai-dynamo/grove/operator/api/common/constants"
 	grovecorev1alpha1 "github.com/ai-dynamo/grove/operator/api/core/v1alpha1"
+	"github.com/ai-dynamo/grove/operator/internal/constants"
 
 	"github.com/go-logr/logr"
 	"github.com/samber/lo"
@@ -179,7 +180,7 @@ func TestCreatePCSReplicaDeleteTaskIgnoresStaleSiblingFlag(t *testing.T) {
 		Build()
 	r := _resource{client: cl, eventRecorder: record.NewFakeRecorder(10)}
 
-	task := r.createPCSReplicaDeleteTask(logr.Discard(), pcs, 0, "sg-a regressed again")
+	task := r.createPCSReplicaDeleteTask(logr.Discard(), pcs, 0, constants.ReasonPodCliqueSetReplicaDeleteSuccessful, "sg-a regressed again")
 	require.NoError(t, task.Fn(context.Background()))
 
 	// The delete must have run despite sg-b's stale flag.
@@ -218,7 +219,7 @@ func TestCreatePCSReplicaDeleteTaskDeletesPodGangMap(t *testing.T) {
 		Build()
 	r := _resource{client: cl, eventRecorder: record.NewFakeRecorder(10)}
 
-	require.NoError(t, r.createPCSReplicaDeleteTask(logr.Discard(), pcs, 0, "full replica gang termination").Fn(context.Background()))
+	require.NoError(t, r.createPCSReplicaDeleteTask(logr.Discard(), pcs, 0, constants.ReasonPodCliqueSetReplicaDeleteSuccessful, "full replica gang termination").Fn(context.Background()))
 
 	// PodCliques of the replica are deleted.
 	pclqList := &grovecorev1alpha1.PodCliqueList{}

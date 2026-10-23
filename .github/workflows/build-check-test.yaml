@@ -143,6 +143,8 @@ jobs:
             test_pattern: "^Test_RS"
           - test_name: podgangmap_reconstruct
             test_pattern: "^Test_PGMR"
+          - test_name: minavailable_recreate
+            test_pattern: "^Test_MA[0-9]"
           - test_name: version_upgrade
             test_pattern: "^Test_VUPG"
             make_target: "run-upgrade-e2e"

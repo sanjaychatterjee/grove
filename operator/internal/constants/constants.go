@@ -103,6 +103,9 @@ const (
 	ReasonPodCliqueSetReplicaDeleteSuccessful = "PodCliqueSetReplicaDeleteSuccessful"
 	// ReasonPodCliqueSetReplicaDeleteFailed is an event reason which represents that the deletion of a PodCliqueSet replica failed.
 	ReasonPodCliqueSetReplicaDeleteFailed = "PodCliqueSetReplicaDeleteFailed"
+	// ReasonGangShapeChanged is an event reason which represents that a PodCliqueSet replica was deleted to be recreated
+	// because the MinAvailable of a clique template or a PodCliqueScalingGroup config changed.
+	ReasonGangShapeChanged = "GangShapeChanged"
 )
 
 // constants for ClusterTopologyBinding lifecycle events

@@ -243,7 +243,8 @@ func buildStandalonePCLQInfosForAnchorEntry(ss *syncState, pcsReplicaIndex int, 
 		if !ok || desiredPCLQReplicas == 0 {
 			continue
 		}
-		minAvailable := *cliqueTemplate.Spec.MinAvailable
+		pclqFQN := apicommon.GeneratePodCliqueName(apicommon.ResourceNameReplica{Name: ss.pcs.Name, Replica: pcsReplicaIndex}, cliqueTemplate.Name)
+		minAvailable := ss.pclqMinAvailable(pclqFQN, cliqueTemplate)
 		if !isBaseAnchor {
 			// MinReplicas is the pod count the scheduler must gang schedule, and it decides gang termination.
 			// Only the base anchor carries the clique's guaranteed MinAvailable. Scale-in drains the newer
@@ -255,7 +256,6 @@ func buildStandalonePCLQInfosForAnchorEntry(ss *syncState, pcsReplicaIndex int, 
 			// so a genuine drop below the clique's guarantee still gang-terminates there.
 			minAvailable = min(minAvailable, desiredPCLQReplicas)
 		}
-		pclqFQN := apicommon.GeneratePodCliqueName(apicommon.ResourceNameReplica{Name: ss.pcs.Name, Replica: pcsReplicaIndex}, cliqueTemplate.Name)
 		pi := pclqInfo{
 			fqn:          pclqFQN,
 			replicas:     desiredPCLQReplicas,
@@ -347,7 +347,7 @@ func buildPCLQInfosAndTopoConstraintsForPCSGReplica(ss *syncState, pcsReplicaInd
 		pi := pclqInfo{
 			fqn:          pclqFQN,
 			replicas:     replicas,
-			minAvailable: *pclqTemplateSpec.Spec.MinAvailable,
+			minAvailable: ss.pclqMinAvailable(pclqFQN, pclqTemplateSpec),
 			isStandalone: false,
 		}
 		pi.topologyConstraint = createTopologyPackConstraint(ss, types.NamespacedName{Namespace: ss.pcs.Namespace, Name: pclqFQN}, pclqTemplateSpec.TopologyConstraint)
@@ -813,6 +813,16 @@ func (ss *syncState) getPodCliques(podGang *podGangInfo) []grovecorev1alpha1.Pod
 		}
 	}
 	return constituentPCLQs
+}
+
+// pclqMinAvailable returns the MinAvailable of the named PodClique when it exists, or of its template otherwise.
+// A PodClique keeps the MinAvailable it was created with until the gang-shape recreate rebuilds its PodCliqueSet
+// replica, so a PodGang of a replica that is not recreated yet keeps the gang shape its pods were created for.
+func (ss *syncState) pclqMinAvailable(pclqFQN string, pclqTemplateSpec *grovecorev1alpha1.PodCliqueTemplateSpec) int32 {
+	if pclq, ok := ss.existingPCLQByName[pclqFQN]; ok && pclq.Spec.MinAvailable != nil {
+		return *pclq.Spec.MinAvailable
+	}
+	return *pclqTemplateSpec.Spec.MinAvailable
 }
 
 // podGangInfoByName builds a name-keyed map for O(1) podGangInfo lookups. Kept local because

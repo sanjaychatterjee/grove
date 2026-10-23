@@ -112,7 +112,7 @@ func denyReplicasChangeDuringCoherentUpdate(ctx context.Context, cl client.Clien
 	return admission.Allowed("owning PodCliqueSet has no coherent update in progress")
 }
 
-// denyReplicasBelowMinAvailable validates a spec.replicas change against the component's immutable
+// denyReplicasBelowMinAvailable validates a spec.replicas change against the component's
 // spec.minAvailable, read from the stored resource in target (which also covers a scale subresource).
 // The allowed values are:
 //   - 0, so a component can be parked idle and scaled back up later.
@@ -128,8 +128,9 @@ func denyReplicasBelowMinAvailable(target client.Object, newReplicas int32) admi
 }
 
 // minAvailableOf returns spec.minAvailable of the fetched PodClique or PodCliqueScalingGroup, or nil for any
-// other type. minAvailable is immutable, so the stored value is also the value the request would produce
-// for a full update and for a scale subresource request.
+// other type. Only the operator writes spec.minAvailable on these resources, and never together with
+// spec.replicas, so the stored value is also the value the request would produce for a full update and for a
+// scale subresource request.
 func minAvailableOf(target client.Object) *int32 {
 	switch resource := target.(type) {
 	case *grovecorev1alpha1.PodClique:

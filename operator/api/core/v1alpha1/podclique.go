@@ -70,6 +70,10 @@ type PodCliqueSpec struct {
 	// 2. It defines the minimum requirement of available pods in a PodClique. Violation of this threshold will result
 	// in termination of the PodGang that it belongs to.
 	// If MinAvailable is not set, then it defaults to 1.
+	// Changing MinAvailable in a PodCliqueSet clique template changes the gang shape of every PodCliqueSet replica, so
+	// every replica is deleted and recreated, one at a time and under every update strategy, OnDelete included. An
+	// update in progress is cancelled in favour of the recreate. Each recreate takes the whole replica down until it
+	// is rebuilt.
 	// +kubebuilder:default=1
 	// +optional
 	MinAvailable *int32 `json:"minAvailable,omitempty"`

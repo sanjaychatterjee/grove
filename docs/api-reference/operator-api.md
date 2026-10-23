@@ -124,6 +124,25 @@ _Appears in:_
 
 
 
+#### GangShapeRecreateProgress
+
+
+
+GangShapeRecreateProgress captures the progress of recreating the PodCliqueSet replicas whose gang shape is stale.
+A replica is stale when the MinAvailable of one of its PodCliques or PodCliqueScalingGroups differs from the
+PodCliqueSet template. Stale replicas are deleted and recreated one at a time.
+
+
+
+_Appears in:_
+- [PodCliqueSetStatus](#podcliquesetstatus)
+
+| Field | Description | Default | Validation |
+| --- | --- | --- | --- |
+| `startedAt` _[Time](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.33/#time-v1-meta)_ | StartedAt is the time at which the first stale replica was found. |  |  |
+| `currentlyRecreating` _[PodCliqueSetReplicaRecreateProgress](#podcliquesetreplicarecreateprogress)_ | CurrentlyRecreating is the replica that was deleted last. It is cleared once that replica is rebuilt, and also<br />available again if it was available when it was deleted. |  |  |
+
+
 #### HeadlessServiceConfig
 
 
@@ -328,7 +347,7 @@ _Appears in:_
 | `cliqueNames` _string array_ | CliqueNames is the ordered list of PodClique names that are part of the scaling group.<br />The order determines the group-wide pod indices exposed through the<br />grove.io/podcliquescalinggroup-pod-index Pod label and GROVE_PCSG_POD_INDEX environment variable. |  |  |
 | `annotations` _object (keys:string, values:string)_ | Annotations is an unstructured key value map stored with a resource that may be<br />set by external tools to store and retrieve arbitrary metadata. They are not<br />queryable and should be preserved when modifying objects.<br />More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/annotations |  |  |
 | `replicas` _integer_ | Replicas is the desired number of replicas for the scaling group at template level.<br />This allows one to control the replicas of the scaling group at startup.<br />If not specified, it defaults to 1. | 1 |  |
-| `minAvailable` _integer_ | MinAvailable serves two purposes:<br />Gang Scheduling:<br />It defines the minimum number of replicas that are guaranteed to be gang scheduled.<br />Gang Termination:<br />It defines the minimum requirement of available replicas for a PodCliqueScalingGroup.<br />Violation of this threshold for a duration beyond TerminationDelay will result in termination of the PodCliqueSet replica that it belongs to.<br />Default: If not specified, it defaults to 1.<br />Constraints:<br />MinAvailable cannot be greater than Replicas.<br />If ScaleConfig is defined then its MinAvailable should not be less than ScaleConfig.MinReplicas. | 1 |  |
+| `minAvailable` _integer_ | MinAvailable serves two purposes:<br />Gang Scheduling:<br />It defines the minimum number of replicas that are guaranteed to be gang scheduled.<br />Gang Termination:<br />It defines the minimum requirement of available replicas for a PodCliqueScalingGroup.<br />Violation of this threshold for a duration beyond TerminationDelay will result in termination of the PodCliqueSet replica that it belongs to.<br />Default: If not specified, it defaults to 1.<br />Constraints:<br />MinAvailable cannot be greater than Replicas.<br />If ScaleConfig is defined then its MinAvailable should not be less than ScaleConfig.MinReplicas.<br />Mutability:<br />MinAvailable fixes the gang shape of every PodCliqueSet replica, so changing it deletes and recreates every<br />PodCliqueSet replica, one at a time and under every update strategy, OnDelete included. An update in progress<br />is cancelled in favour of the recreate. Each recreate takes the whole replica down until it is rebuilt. | 1 |  |
 | `scaleConfig` _[AutoScalingConfig](#autoscalingconfig)_ | ScaleConfig is the horizontal pod autoscaler configuration for the pod clique scaling group. |  |  |
 | `rollingUpdate` _[RollingUpdateConfiguration](#rollingupdateconfiguration)_ | RollingUpdate is the per-component update configuration for this PodCliqueScalingGroup.<br />It governs the rolling update of every constituent member PodClique. The member<br />PodCliqueTemplateSpecs must not carry their own RollingUpdate. |  |  |
 | `resourceSharing` _[PCSGResourceSharingSpec](#pcsgresourcesharingspec) array_ | ResourceSharing defines shared ResourceClaims at the PCSG level.<br />Each entry references a template (internal or external) and specifies a Scope:<br />  - AllReplicas: one RC for the entire PCSG, shared across all replicas<br />  - PerReplica: one RC per PCSG replica, shared across all PCLQs in that replica<br />The optional Filter field controls which PodCliques receive the claims.<br />At PCSG level, only childCliqueNames filtering is available. |  |  |
@@ -418,6 +437,24 @@ PodCliqueSet is a set of PodGangs defining specification on how to spread and ma
 | `status` _[PodCliqueSetStatus](#podcliquesetstatus)_ | Status defines the status of the PodCliqueSet. |  |  |
 
 
+#### PodCliqueSetReplicaRecreateProgress
+
+
+
+PodCliqueSetReplicaRecreateProgress captures the recreate of one PodCliqueSet replica.
+
+
+
+_Appears in:_
+- [GangShapeRecreateProgress](#gangshaperecreateprogress)
+
+| Field | Description | Default | Validation |
+| --- | --- | --- | --- |
+| `replicaIndex` _integer_ | ReplicaIndex is the index of the PodCliqueSet replica being recreated. |  |  |
+| `wasAvailable` _boolean_ | WasAvailable reports whether the replica was available when it was deleted. |  |  |
+| `startedAt` _[Time](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.33/#time-v1-meta)_ | StartedAt is the time at which the replica was deleted. |  |  |
+
+
 #### PodCliqueSetReplicaUpdateProgress
 
 
@@ -479,6 +516,7 @@ _Appears in:_
 | `podGangStatuses` _[PodGangStatus](#podgangstatus) array_ | PodGangStatuses captures the status for all the PodGang's that are part of the PodCliqueSet. |  |  |
 | `currentGenerationHash` _string_ | CurrentGenerationHash is a hash value generated out of a collection of fields in a PodCliqueSet.<br />Since only a subset of fields is taken into account when generating the hash, not every change in the PodCliqueSetSpec will<br />be accounted for when generating this hash value. A field in PodCliqueSetSpec is included if a change to it triggers<br />a rolling recreate of PodCliques and/or PodCliqueScalingGroups.<br />Only if this value is not nil and the newly computed hash value is different from the persisted CurrentGenerationHash value<br />then an update needs to be triggered. |  |  |
 | `updateProgress` _[PodCliqueSetUpdateProgress](#podcliquesetupdateprogress)_ | UpdateProgress represents the progress of an update. |  |  |
+| `gangShapeRecreate` _[GangShapeRecreateProgress](#gangshaperecreateprogress)_ | GangShapeRecreate is set while PodCliqueSet replicas whose gang shape is stale, after a MinAvailable change<br />in a clique template or a PodCliqueScalingGroup config, are being recreated. It is cleared once none is left. |  |  |
 
 
 #### PodCliqueSetTemplateSpec
@@ -567,7 +605,7 @@ _Appears in:_
 | `roleName` _string_ | RoleName is the name of the role that this PodClique will assume. |  |  |
 | `podSpec` _[PodSpec](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.33/#podspec-v1-core)_ | Spec is the spec of the pods in the clique. |  |  |
 | `replicas` _integer_ | Replicas is the number of replicas of the pods in the clique. It cannot be less than 1. |  |  |
-| `minAvailable` _integer_ | MinAvailable serves two purposes:<br />1. It defines the minimum number of pods that are guaranteed to be gang scheduled.<br />2. It defines the minimum requirement of available pods in a PodClique. Violation of this threshold will result<br />in termination of the PodGang that it belongs to.<br />If MinAvailable is not set, then it defaults to 1. | 1 |  |
+| `minAvailable` _integer_ | MinAvailable serves two purposes:<br />1. It defines the minimum number of pods that are guaranteed to be gang scheduled.<br />2. It defines the minimum requirement of available pods in a PodClique. Violation of this threshold will result<br />in termination of the PodGang that it belongs to.<br />If MinAvailable is not set, then it defaults to 1.<br />Changing MinAvailable in a PodCliqueSet clique template changes the gang shape of every PodCliqueSet replica, so<br />every replica is deleted and recreated, one at a time and under every update strategy, OnDelete included. An<br />update in progress is cancelled in favour of the recreate. Each recreate takes the whole replica down until it<br />is rebuilt. | 1 |  |
 | `startsAfter` _string array_ | StartsAfter provides you a way to explicitly define the startup dependencies amongst cliques.<br />If CliqueStartupType in PodGang has been set to 'CliqueStartupTypeExplicit', then to create an ordered start<br />amongst PodClique's StartsAfter can be used. A forest of DAG's can be defined to model any start order dependencies.<br />If there are more than one PodClique's defined and StartsAfter is not set for any of them, then their startup order<br />is random at best and must not be relied upon.<br />Validations:<br />1. If a StartsAfter has been defined and one or more cycles are detected in DAG's then it will be flagged as validation error.<br />2. If StartsAfter is defined and does not identify any PodClique then it will be flagged as a validation error. |  |  |
 | `autoScalingConfig` _[AutoScalingConfig](#autoscalingconfig)_ | ScaleConfig is the horizontal pod autoscaler configuration for a PodClique. |  |  |
 
