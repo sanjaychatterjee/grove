@@ -427,6 +427,71 @@ func TestValidateUpdate(t *testing.T) {
 }
 
 // TestValidateDelete tests validation of PodCliqueSet deletion requests.
+// TestValidateUpdateMinAvailableRange verifies that MinAvailable of a clique template or a PodCliqueScalingGroup
+// config may be changed, but only within 1 and the replicas of the clique or PodCliqueScalingGroup.
+func TestValidateUpdateMinAvailableRange(t *testing.T) {
+	// newPCS returns a PodCliqueSet with a standalone clique of 2 replicas and a PodCliqueScalingGroup of 3
+	// replicas.
+	newPCS := func(cliqueMinAvailable, pcsgMinAvailable int32) *grovecorev1alpha1.PodCliqueSet {
+		return testutils.NewPodCliqueSetBuilder("test-pcs", "default", uuid.NewUUID()).
+			WithReplicas(1).
+			WithTerminationDelay(4 * time.Hour).
+			WithCliqueStartupType(ptr.To(grovecorev1alpha1.CliqueStartupTypeAnyOrder)).
+			WithPodCliqueTemplateSpec(testutils.NewPodCliqueTemplateSpecBuilder("leader").
+				WithReplicas(2).
+				WithRoleName("leader").
+				WithMinAvailable(cliqueMinAvailable).
+				Build()).
+			WithPodCliqueTemplateSpec(testutils.NewPodCliqueTemplateSpecBuilder("worker").
+				WithReplicas(1).
+				WithRoleName("worker").
+				WithMinAvailable(1).
+				Build()).
+			WithPodCliqueScalingGroupConfig(grovecorev1alpha1.PodCliqueScalingGroupConfig{
+				Name:         "sg",
+				CliqueNames:  []string{"worker"},
+				Replicas:     ptr.To(int32(3)),
+				MinAvailable: ptr.To(pcsgMinAvailable),
+			}).
+			Build()
+	}
+	tests := []struct {
+		name          string
+		newObj        *grovecorev1alpha1.PodCliqueSet
+		errorContains string
+	}{
+		{name: "clique minAvailable changed within range", newObj: newPCS(2, 1)},
+		{name: "PCSG minAvailable changed within range", newObj: newPCS(1, 3)},
+		{name: "clique minAvailable changed to 0", newObj: newPCS(0, 1), errorContains: "spec.template.cliques[0].spec.minAvailable"},
+		{name: "clique minAvailable changed above replicas", newObj: newPCS(3, 1), errorContains: "minAvailable must not be greater than replicas"},
+		{name: "PCSG minAvailable changed to 0", newObj: newPCS(1, 0), errorContains: "spec.template.podCliqueScalingGroups[0].minAvailable"},
+		{name: "PCSG minAvailable changed above replicas", newObj: newPCS(1, 4), errorContains: "minAvailable must not be greater than replicas"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cl := testutils.NewTestClientBuilder().Build()
+			mgr := &testutils.FakeManager{Client: cl, Scheme: cl.Scheme(), Logger: logr.Discard()}
+			cfg := groveconfigv1alpha1.OperatorConfiguration{
+				TopologyAwareScheduling: getDefaultTASConfig(),
+				Network:                 getDefaultNetworkConfig(),
+				Scheduler: groveconfigv1alpha1.SchedulerConfiguration{
+					Profiles:           []groveconfigv1alpha1.SchedulerProfile{{Name: groveconfigv1alpha1.SchedulerNameKube}},
+					DefaultProfileName: string(groveconfigv1alpha1.SchedulerNameKube),
+				},
+			}
+			handler := NewHandler(mgr, &cfg, testutils.NewDefaultFakeRegistry())
+
+			_, err := handler.ValidateUpdate(context.Background(), newPCS(1, 1), tt.newObj)
+			if tt.errorContains == "" {
+				assert.NoError(t, err)
+				return
+			}
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), tt.errorContains)
+		})
+	}
+}
+
 func TestValidateDelete(t *testing.T) {
 	cl := testutils.NewTestClientBuilder().Build()
 	mgr := &testutils.FakeManager{
